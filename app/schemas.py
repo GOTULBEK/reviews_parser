@@ -169,10 +169,15 @@ class BranchRatingSummary(BaseModel):
 
 
 class TopMention(BaseModel):
-    """Стаб для top_problems / top_praise. Требует NLP — пока пусто."""
-    key: str
+    """
+    Тема, выявленная в отзывах. `label` — канонический термин (лемма или
+    биграмма) из реальных отзывов. `examples` — до 3 коротких цитат, где
+    термин встречается. Формы одного слова ('очередь' / 'очереди') сливаются
+    через лемматизацию, опечатки — через edit-distance.
+    """
     label: str
     mentions: int
+    examples: list[str] = []
 
 
 class OverviewResponse(BaseModel):
@@ -183,9 +188,9 @@ class OverviewResponse(BaseModel):
     kpis: KPIs
     sentiment: SentimentBreakdown
     branch_ratings: list[BranchRatingSummary]
-    top_problems: list[TopMention] = []      # NLP not implemented
-    top_praise: list[TopMention] = []        # NLP not implemented
-    analytics_note: str | None = None        # честность по поводу стабов
+    top_problems: list[TopMention] = []
+    top_praise: list[TopMention] = []
+    analytics_note: str | None = None
 
 
 # ---------------------------------------------------------------------------
