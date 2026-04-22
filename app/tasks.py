@@ -34,6 +34,54 @@ async def _upsert_company(session: AsyncSession, name: str) -> Company:
     return result.scalar_one()
 
 
+async def _get_unknown_company(session: AsyncSession) -> Company:
+    """
+    Техническая заглушка для создания "пустых" Branch до того,
+    как узнаем org_name из 2ГИС. Потом company_id будет обновлён при upsert.
+    """
+    return await _upsert_company(session, "__unknown__")
+
+
+async def _seed_task_branches(
+    session: AsyncSession,
+    task_id: UUID,
+    branches: list[dict],
+    unknown_company_id: UUID,
+) -> None:
+    """
+    Привязывает ВСЕ филиалы задачи заранее, чтобы агрегации (например reviews_total)
+    считались по полному списку, даже пока скрап ещё идёт.
+    """
+    if not branches:
+        return
+
+    for b in branches:
+        stmt = (
+            pg_insert(Branch)
+            .values(
+                gis_branch_id=int(b["gis_branch_id"]),
+                company_id=unknown_company_id,
+                url=b["firm_url"],
+            )
+            .on_conflict_do_update(
+                index_elements=["gis_branch_id"],
+                set_={"url": b["firm_url"]},
+            )
+        )
+        await session.execute(stmt)
+
+    gis_ids = [int(b["gis_branch_id"]) for b in branches]
+    result = await session.execute(select(Branch).where(Branch.gis_branch_id.in_(gis_ids)))
+    existing = result.scalars().all()
+
+    for br in existing:
+        await session.execute(
+            pg_insert(SearchTaskBranch)
+            .values(task_id=task_id, branch_id=br.id)
+            .on_conflict_do_nothing()
+        )
+
+
 async def _upsert_branch(session: AsyncSession, data: dict, company_id: UUID) -> Branch:
     now = datetime.now(tz=timezone.utc)
     values = {
@@ -169,6 +217,11 @@ async def run_scrape_task(task_id: UUID, branches: list[dict]) -> None:
         task.status = TaskStatus.running
         task.started_at = datetime.now(tz=timezone.utc)
         task.total_branches_found = len(branches)
+
+        unknown_company = await _get_unknown_company(session)
+        await session.flush()
+        await _seed_task_branches(session, task_id, branches, unknown_company.id)
+
         await session.commit()
 
     timeout = httpx.Timeout(settings.request_timeout_seconds, connect=10)

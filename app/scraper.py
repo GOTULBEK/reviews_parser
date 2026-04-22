@@ -7,6 +7,7 @@ import random
 import re
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -47,26 +48,48 @@ async def search_branches(
     Единственная зацепка — регулярка на паттерн `/firm/<digits>` в HTML.
     Дубли убираются, порядок первого появления сохраняется (соответствует выдаче).
     """
-    search_url = f"{SITE_BASE}/{city}/search/{query}"
-    logger.info("Search request: %s", search_url)
-
-    try:
-        res = await client.get(search_url, headers=_HEADERS_HTML)
-    except httpx.RequestError as e:
-        logger.error("Search HTTP error: %s", e)
-        return []
-
-    if res.status_code != 200:
-        logger.error("Search HTTP %d: %s", res.status_code, res.text[:200])
-        return []
-
     seen: set[int] = set()
     ordered: list[int] = []
-    for m in re.finditer(r"/firm/(\d+)", res.text):
-        fid = int(m.group(1))
-        if fid not in seen:
-            seen.add(fid)
-            ordered.append(fid)
+
+    # 2GIS search pages:
+    # - page 1: /{city}/search/{query}
+    # - page N: /{city}/search/{query}/page/{N}/
+    safe_query = quote(query, safe="")
+    max_pages = 50  # safety cap to avoid infinite loops on markup changes
+
+    for page in range(1, max_pages + 1):
+        if len(ordered) >= max_branches:
+            break
+
+        if page == 1:
+            search_url = f"{SITE_BASE}/{city}/search/{safe_query}"
+        else:
+            search_url = f"{SITE_BASE}/{city}/search/{safe_query}/page/{page}/"
+
+        logger.info("Search request: %s", search_url)
+
+        try:
+            res = await client.get(search_url, headers=_HEADERS_HTML)
+        except httpx.RequestError as e:
+            logger.error("Search HTTP error: %s", e)
+            break
+
+        if res.status_code != 200:
+            logger.error("Search HTTP %d: %s", res.status_code, res.text[:200])
+            break
+
+        before = len(ordered)
+        for m in re.finditer(r"/firm/(\d+)", res.text):
+            fid = int(m.group(1))
+            if fid not in seen:
+                seen.add(fid)
+                ordered.append(fid)
+                if len(ordered) >= max_branches:
+                    break
+
+        # Stop when page is empty (no new firm IDs).
+        if len(ordered) == before:
+            break
 
     ordered = ordered[:max_branches]
     return [

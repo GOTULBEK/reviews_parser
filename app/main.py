@@ -26,10 +26,13 @@ from .schemas import (
     BranchResponse,
     BranchWithReviewsResponse,
     KPIs,
+    OverviewBranchItem,
     OverviewResponse,
     PreviewRequest,
     PreviewResponse,
     ProblemsResponse,
+    RatingBucket,
+    RatingDistribution,
     ReviewListItem,
     ReviewResponse,
     ReviewsListResponse,
@@ -218,6 +221,14 @@ async def get_task_status(task_id: UUID, session: AsyncSession = Depends(get_ses
     if not task:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
 
+    reviews_total_stmt = (
+        select(func.coalesce(func.sum(Branch.total_reviews), 0))
+        .select_from(Branch)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
+        .where(SearchTaskBranch.task_id == task_id)
+    )
+    reviews_total = (await session.execute(reviews_total_stmt)).scalar_one()
+
     return TaskStatusResponse(
         task_id=task.id,
         status=task.status.value,
@@ -226,6 +237,8 @@ async def get_task_status(task_id: UUID, session: AsyncSession = Depends(get_ses
         total_branches_found=task.total_branches_found,
         branches_completed=task.branches_completed,
         total_reviews_collected=task.total_reviews_collected,
+        reviews_total=int(reviews_total or 0),
+        reviews_parsed=task.total_reviews_collected,
         error_message=task.error_message,
         created_at=task.created_at,
         started_at=task.started_at,
@@ -297,12 +310,60 @@ async def get_overview(
         neutral_pct=_pct(neu_count, reviews_total),
     )
 
+    # Rating distribution (1..5 only, unrated ignored)
+    rating_stmt = (
+        select(Review.rating, func.count().label("cnt"))
+        .select_from(Review)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .where(SearchTaskBranch.task_id == task_id)
+        .where(Review.rating.in_([1, 2, 3, 4, 5]))
+        .group_by(Review.rating)
+    )
+    rating_rows = (await session.execute(rating_stmt)).all()
+    counts: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    for r in rating_rows:
+        if r.rating in counts:
+            counts[int(r.rating)] = int(r.cnt or 0)
+
+    total_rated = sum(counts.values())
+
+    def _pct_int(n: int, d: int) -> int:
+        if d <= 0:
+            return 0
+        return int(round(n * 100.0 / d))
+
+    stars_payload: dict[str, RatingBucket] = {
+        str(star): RatingBucket(count=counts[star], pct=_pct_int(counts[star], total_rated))
+        for star in (1, 2, 3, 4, 5)
+    }
+    one_two_count = counts[1] + counts[2]
+    rating_distribution = RatingDistribution(
+        total_rated=total_rated,
+        stars=stars_payload,
+        one_two=RatingBucket(count=one_two_count, pct=_pct_int(one_two_count, total_rated)),
+    )
+
     # Топ филиалов по рейтингу (ties — по числу отзывов)
     sorted_branches = sorted(
         branches,
         key=lambda b: (b.rating if b.rating is not None else -1.0, b.total_reviews or 0),
         reverse=True,
     )[:top_branches_limit]
+
+    overview_branches = [
+        OverviewBranchItem(
+            branch_id=b.id,
+            gis_branch_id=str(b.gis_branch_id),
+            name=(b.name or "").strip() or f"Филиал {b.gis_branch_id}",
+            city=task.city,
+            address=(b.address or "").strip() or "Адрес не найден",
+            district=None,
+            lat=None,
+            lng=None,
+            url=b.url if getattr(b, "url", None) else None,
+        )
+        for b in branches
+    ]
 
     branch_ratings = [
         BranchRatingSummary(
@@ -347,6 +408,8 @@ async def get_overview(
         city=task.city,
         kpis=kpis,
         sentiment=sentiment,
+        rating_distribution=rating_distribution,
+        branches=overview_branches,
         branch_ratings=branch_ratings,
         top_problems=top_problems,
         top_praise=top_praise,
@@ -629,9 +692,16 @@ async def get_task_results(
 
     out: list[BranchWithReviewsResponse] = []
     for b in branches:
-        payload = BranchWithReviewsResponse.model_validate(b)
+        # IMPORTANT: Branch.reviews is an async lazy relationship.
+        # If we call BranchWithReviewsResponse.model_validate(b) while reviews are not
+        # eagerly loaded, Pydantic will try to access `b.reviews` and crash with
+        # MissingGreenlet. Only validate the "with reviews" model when reviews are loaded.
         if include_reviews:
+            payload = BranchWithReviewsResponse.model_validate(b)
             payload.reviews = [ReviewResponse.model_validate(r) for r in b.reviews]
+        else:
+            base = BranchResponse.model_validate(b)
+            payload = BranchWithReviewsResponse(**base.model_dump(), reviews=[])
         out.append(payload)
 
     return TaskResultResponse(

@@ -82,6 +82,8 @@ class TaskStatusResponse(BaseModel):
     total_branches_found: int
     branches_completed: int
     total_reviews_collected: int
+    reviews_total: int
+    reviews_parsed: int
     error_message: str | None = None
     created_at: datetime
     started_at: datetime | None = None
@@ -168,6 +170,29 @@ class BranchRatingSummary(BaseModel):
     total_reviews: int
 
 
+class RatingBucket(BaseModel):
+    count: int
+    pct: int
+
+
+class RatingDistribution(BaseModel):
+    total_rated: int
+    stars: dict[str, RatingBucket]
+    one_two: RatingBucket | None = None
+
+
+class OverviewBranchItem(BaseModel):
+    branch_id: UUID
+    gis_branch_id: BranchIdStr
+    name: str
+    city: str
+    address: str
+    district: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+    url: str | None = None
+
+
 class TopMention(BaseModel):
     """
     Тема, выявленная в отзывах. `label` — канонический термин (лемма или
@@ -187,6 +212,8 @@ class OverviewResponse(BaseModel):
     city: str
     kpis: KPIs
     sentiment: SentimentBreakdown
+    rating_distribution: RatingDistribution
+    branches: list[OverviewBranchItem]
     branch_ratings: list[BranchRatingSummary]
     top_problems: list[TopMention] = []
     top_praise: list[TopMention] = []
