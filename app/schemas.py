@@ -205,6 +205,41 @@ class TopMention(BaseModel):
     examples: list[str] = []
 
 
+class ReviewDynamicsPoint(BaseModel):
+    # Backward compatible:
+    # - monthly buckets use `month` (YYYY-MM)
+    # - daily buckets use `date` (YYYY-MM-DD)
+    month: str | None = None
+    date: str | None = None
+    all: int
+    pos: int
+    neg: int
+    neu: int | None = None
+
+
+class ReviewDynamics(BaseModel):
+    range: str
+    range_days: int | None = None
+    timezone: str
+    granularity: Literal["day", "month"] | None = None
+    points: list[ReviewDynamicsPoint]
+
+
+class BranchKPIs(BaseModel):
+    avg_rating: float | None = None
+    reviews_total: int
+    negative_pct: float
+    replies_pct: float
+
+
+class OverviewBranchAnalytics(BaseModel):
+    kpis: BranchKPIs
+    rating_distribution: RatingDistribution
+    review_dynamics: ReviewDynamics
+    top_praise: list[TopMention] = []
+    top_problems: list[TopMention] = []
+
+
 class OverviewResponse(BaseModel):
     task_id: UUID
     status: str
@@ -218,6 +253,8 @@ class OverviewResponse(BaseModel):
     top_problems: list[TopMention] = []
     top_praise: list[TopMention] = []
     analytics_note: str | None = None
+    review_dynamics: ReviewDynamics | None = None
+    by_branch: dict[str, OverviewBranchAnalytics] | None = None
 
 
 # ---------------------------------------------------------------------------

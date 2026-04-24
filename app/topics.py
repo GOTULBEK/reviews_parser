@@ -24,6 +24,22 @@ from typing import Iterable, Literal
 
 import pymorphy3
 
+# Optional heavy deps for the BERT fallback. Loaded lazily.
+# We intentionally avoid importing these unconditionally so the service can run
+# without ML deps (e.g. in minimal deployments).
+try:  # pylint: disable=import-error
+    import numpy as np  # type: ignore
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+
+try:  # pylint: disable=import-error
+    import torch  # type: ignore
+    from transformers import AutoModel, AutoTokenizer  # type: ignore
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+    AutoModel = None  # type: ignore[assignment]
+    AutoTokenizer = None  # type: ignore[assignment]
+
 # Ленивая инициализация — MorphAnalyzer создается 1 раз и переиспользуется.
 _morph: pymorphy3.MorphAnalyzer | None = None
 
@@ -324,6 +340,185 @@ def extract_topics(
     top_problems = score_group("neg")
     top_praise = score_group("pos")
     return top_problems, top_praise
+
+
+# ---------------------------------------------------------------------------
+# BERT embeddings fallback (semantic clustering)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_BERT_MODEL = "bert-base-multilingual-cased"
+
+
+@lru_cache(maxsize=1)
+def _load_bert(model_name: str = _DEFAULT_BERT_MODEL):
+    if AutoTokenizer is None or AutoModel is None or torch is None:
+        raise RuntimeError("transformers/torch not installed")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.eval()
+    return tokenizer, model
+
+
+def _mean_pool(last_hidden_state, attention_mask):
+    # last_hidden_state: (B, T, H)
+    # attention_mask: (B, T)
+    mask = attention_mask.unsqueeze(-1).type_as(last_hidden_state)
+    summed = (last_hidden_state * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1)
+    return summed / counts
+
+
+def _embed_texts_bert(
+    texts: list[str],
+    *,
+    model_name: str = _DEFAULT_BERT_MODEL,
+    batch_size: int = 32,
+    max_length: int = 192,
+):
+    if np is None or torch is None:
+        raise RuntimeError("numpy/torch not installed")
+    tokenizer, model = _load_bert(model_name)
+
+    device = torch.device("cpu")
+    model.to(device)
+
+    all_vecs: list[np.ndarray] = []
+    with torch.inference_mode():
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            enc = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            out = model(**enc)
+            pooled = _mean_pool(out.last_hidden_state, enc["attention_mask"])
+            vec = pooled.detach().cpu().float().numpy()
+            # Normalize for cosine similarity.
+            norms = np.linalg.norm(vec, axis=1, keepdims=True)
+            vec = vec / np.clip(norms, 1e-12, None)
+            all_vecs.append(vec)
+    return np.vstack(all_vecs) if all_vecs else np.zeros((0, 0), dtype=np.float32)
+
+
+@dataclass
+class _Cluster:
+    idxs: list[int]
+    centroid: "np.ndarray"  # normalized
+
+
+def _cluster_embeddings_greedy(
+    emb: "np.ndarray",
+    *,
+    sim_threshold: float = 0.60,
+):
+    """
+    Simple online clustering by cosine similarity to centroid.
+    - Good enough for 'top themes' without adding sklearn.
+    - Assumes embeddings are L2-normalized.
+    """
+    if np is None:
+        raise RuntimeError("numpy not installed")
+    clusters: list[_Cluster] = []
+    for i in range(emb.shape[0]):
+        v = emb[i]
+        best_j = -1
+        best_sim = -1.0
+        for j, c in enumerate(clusters):
+            sim = float(np.dot(v, c.centroid))
+            if sim > best_sim:
+                best_sim = sim
+                best_j = j
+        if best_j >= 0 and best_sim >= sim_threshold:
+            c = clusters[best_j]
+            c.idxs.append(i)
+            # Recompute centroid (mean) and renormalize.
+            new_centroid = c.centroid * (len(c.idxs) - 1) + v
+            new_centroid = new_centroid / max(np.linalg.norm(new_centroid), 1e-12)
+            c.centroid = new_centroid
+        else:
+            clusters.append(_Cluster(idxs=[i], centroid=v.copy()))
+    return clusters
+
+
+def _label_cluster(docs: list[ReviewDoc], idxs: list[int]) -> str:
+    """
+    Create a stable short label from the cluster texts using the existing
+    tokenizer+lemmatizer (so labels stay Russian/Kazakh terms, not embeddings).
+    """
+    term_counts: Counter[str] = Counter()
+    for i in idxs:
+        tokens = _normalize_tokens(_tokenize(docs[i].text or ""))
+        ngrams = _extract_ngrams(tokens)
+        term_counts.update(ngrams)
+    if not term_counts:
+        return "тема"
+    # Prefer bigrams if they are informative; otherwise take the top unigram.
+    for term, _ in term_counts.most_common(50):
+        if " " in term:
+            return term
+    return term_counts.most_common(1)[0][0]
+
+
+def extract_topics_bert(
+    reviews: list[ReviewDoc],
+    *,
+    top_n: int = 8,
+    min_mentions: int = 3,
+    example_quote_chars: int = 200,
+    model_name: str = _DEFAULT_BERT_MODEL,
+    sim_threshold: float = 0.60,
+    max_docs_per_group: int = 2000,
+) -> tuple[list[TopicResult], list[TopicResult]]:
+    """
+    Semantic alternative to extract_topics() using BERT embeddings:
+    - Split by rating group (neg vs pos)
+    - Embed each review text
+    - Greedy cosine clustering
+    - Label clusters using existing lemma/ngram extraction
+    """
+    if not reviews:
+        return [], []
+
+    groups: dict[str, list[ReviewDoc]] = defaultdict(list)
+    for r in reviews:
+        if r.text:
+            groups[_classify(r.rating)].append(r)
+
+    def run_group(group_key: str) -> list[TopicResult]:
+        docs = groups.get(group_key, [])
+        if len(docs) < min_mentions:
+            return []
+        docs = docs[:max_docs_per_group]
+
+        texts = [d.text for d in docs]
+        emb = _embed_texts_bert(texts, model_name=model_name)
+        if emb.shape[0] == 0:
+            return []
+        clusters = _cluster_embeddings_greedy(emb, sim_threshold=sim_threshold)
+        # Keep only meaningful clusters.
+        clusters = [c for c in clusters if len(c.idxs) >= min_mentions]
+        clusters.sort(key=lambda c: len(c.idxs), reverse=True)
+        clusters = clusters[:top_n]
+
+        out: list[TopicResult] = []
+        for c in clusters:
+            label = _label_cluster(docs, c.idxs)
+            # Examples: first unique snippets from cluster
+            examples: list[str] = []
+            for idx in c.idxs:
+                if len(examples) >= 3:
+                    break
+                snippet = _make_snippet(docs[idx].text, label, max_len=example_quote_chars)
+                if snippet and snippet not in examples:
+                    examples.append(snippet)
+            out.append(TopicResult(label=label, mentions=len(c.idxs), examples=examples))
+        return out
+
+    return run_group("neg"), run_group("pos")
 
 
 def _make_snippet(text: str, term: str, max_len: int = 200) -> str:
