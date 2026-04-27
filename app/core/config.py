@@ -3,6 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 
+    app_env: str = ""
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/twogis"
     twogis_reviews_api_key: str = "6e7e1929-4ea9-4a5d-8c05-d601860389bd"
     

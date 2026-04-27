@@ -1,8 +1,8 @@
 import logging
 from typing import Any
 from anthropic import AsyncAnthropic
-from .config import settings
-from .schemas import InsightItem, ProblemItem, PriorityItem, TopMention
+from app.core.config import settings
+from app.schemas.dashboard import InsightItem, ProblemItem, PriorityItem, TopMention
 
 logger = logging.getLogger(__name__)
 

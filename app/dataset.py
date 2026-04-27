@@ -7,7 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import settings
+from app.core.config import settings
 
 # NOTE: We keep the required columns first, then add everything else we have.
 

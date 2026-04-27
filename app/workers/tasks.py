@@ -10,11 +10,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import settings
-from .dataset import append_place_row, append_review_row, build_place_row, build_review_row
-from .database import AsyncSessionLocal
-from .models import Branch, Company, Review, SearchTask, SearchTaskBranch, TaskStatus
-from .scraper import scrape_branch
+from app.core.config import settings
+from app.dataset import append_place_row, append_review_row, build_place_row, build_review_row
+from app.db.database import AsyncSessionLocal
+from app.models import Branch, Company, Review, SearchTask, SearchTaskBranch, TaskStatus
+from app.services.scraper import scrape_branch
 
 logger = logging.getLogger(__name__)
 
@@ -183,20 +183,21 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
         reviews_count = await _upsert_reviews(session, data.get("reviews", []), branch.id)
 
         # Dataset logging (CSV) — best-effort, should never fail persistence.
-        try:
-            await append_place_row(
-                build_place_row(task_id=str(task_id), city=task_city, branch_data=data)
-            )
-            for r in data.get("reviews", []) or []:
-                await append_review_row(
-                    build_review_row(
-                        task_id=str(task_id),
-                        place_id=int(data["gis_branch_id"]),
-                        review=r,
-                    )
+        if settings.app_env.lower() == "local":
+            try:
+                await append_place_row(
+                    build_place_row(task_id=str(task_id), city=task_city, branch_data=data)
                 )
-        except Exception:
-            logger.exception("Dataset CSV write failed (task=%s branch=%s)", task_id, data.get("gis_branch_id"))
+                for r in data.get("reviews", []) or []:
+                    await append_review_row(
+                        build_review_row(
+                            task_id=str(task_id),
+                            place_id=int(data["gis_branch_id"]),
+                            review=r,
+                        )
+                    )
+            except Exception:
+                logger.exception("Dataset CSV write failed (task=%s branch=%s)", task_id, data.get("gis_branch_id"))
 
         # Связь задача↔филиал
         await session.execute(
