@@ -51,7 +51,7 @@ from .schemas import (
 )
 from .scraper import SITE_BASE, scrape_branch_preview, search_branches
 from .tasks import run_scrape_task
-from .topics import ReviewDoc, extract_topics, extract_topics_bert
+from .topics import ReviewDoc, extract_topics, extract_topics_embeddings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -418,19 +418,43 @@ async def get_overview(
                     for b in sorted_branches
                 ]
 
-            reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since)
-            top_problems, top_praise = await claude_service.generate_top_mentions(reviews_dicts)
+            from .models import TaskTopicsCache
+            cache_stmt = select(TaskTopicsCache).where(
+                TaskTopicsCache.task_id == task_id,
+                TaskTopicsCache.days == (int(days) if days is not None else None)
+            )
+            topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
 
-            if not top_problems and not top_praise:
-                topic_docs = [ReviewDoc(id=str(i), text=r["text"], rating=r["rating"]) for i, r in enumerate(reviews_dicts)]
-                loop = asyncio.get_running_loop()
+            if topics_cache_row is not None:
+                top_problems = [TopMention(**t) for t in topics_cache_row.top_problems] if topics_cache_row.top_problems else []
+                top_praise = [TopMention(**t) for t in topics_cache_row.top_praise] if topics_cache_row.top_praise else []
+            else:
+                reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since)
+                top_problems, top_praise = await claude_service.generate_top_mentions(reviews_dicts)
+
+                if not top_problems and not top_praise:
+                    topic_docs = [ReviewDoc(id=str(i), text=r["text"], rating=r["rating"]) for i, r in enumerate(reviews_dicts)]
+                    loop = asyncio.get_running_loop()
+                    try:
+                        raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction_embeddings, topic_docs)
+                    except Exception:
+                        logging.exception("Embeddings topic extraction failed, falling back to TF-IDF topics")
+                        raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction, topic_docs)
+                    top_problems = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_problems]
+                    top_praise = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_praise]
+
+                new_cache = TaskTopicsCache(
+                    task_id=task_id,
+                    days=int(days) if days is not None else None,
+                    top_problems=[t.model_dump() for t in top_problems],
+                    top_praise=[t.model_dump() for t in top_praise]
+                )
+                session.add(new_cache)
                 try:
-                    raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction_bert, topic_docs)
+                    await session.commit()
                 except Exception:
-                    logging.exception("BERT topic extraction failed, falling back to TF-IDF topics")
-                    raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction, topic_docs)
-                top_problems = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_problems]
-                top_praise = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_praise]
+                    await session.rollback()
+                    logging.exception("Failed to save topics cache")
 
             if days is not None and int(days) <= 31:
                 # Daily buckets (zero-filled), keyed by local date in _OVERVIEW_TZ.
@@ -830,9 +854,9 @@ def _run_topic_extraction(docs):
     return extract_topics(docs, top_n=8, min_mentions=3)
 
 
-def _run_topic_extraction_bert(docs):
-    """BERT embeddings fallback (threadpool)."""
-    return extract_topics_bert(docs, top_n=8, min_mentions=3)
+def _run_topic_extraction_embeddings(docs):
+    """Sentence-embeddings fallback (threadpool)."""
+    return extract_topics_embeddings(docs, top_n=8, min_mentions=3)
 
 
 async def _fetch_reviews_as_dicts(

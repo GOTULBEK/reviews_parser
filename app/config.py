@@ -23,4 +23,7 @@ class Settings(BaseSettings):
     )
     cors_origins: str = "http://localhost:3000,http://localhost:3001"
 
+    # Dataset logging (CSV, UTF-8). Relative paths are resolved from CWD.
+    dataset_dir: str = "datasets"
+
 settings = Settings()

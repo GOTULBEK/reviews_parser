@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
+from .dataset import append_place_row, append_review_row, build_place_row, build_review_row
 from .database import AsyncSessionLocal
 from .models import Branch, Company, Review, SearchTask, SearchTaskBranch, TaskStatus
 from .scraper import scrape_branch
@@ -170,6 +171,9 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
     company_name = data.get("company_name") or f"Неизвестная компания (branch_id={data['gis_branch_id']})"
 
     async with AsyncSessionLocal() as session:
+        task = await session.get(SearchTask, task_id)
+        task_city = task.city if task is not None else ""
+
         company = await _upsert_company(session, company_name)
         await session.flush()
 
@@ -177,6 +181,22 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
         await session.flush()
 
         reviews_count = await _upsert_reviews(session, data.get("reviews", []), branch.id)
+
+        # Dataset logging (CSV) — best-effort, should never fail persistence.
+        try:
+            await append_place_row(
+                build_place_row(task_id=str(task_id), city=task_city, branch_data=data)
+            )
+            for r in data.get("reviews", []) or []:
+                await append_review_row(
+                    build_review_row(
+                        task_id=str(task_id),
+                        place_id=int(data["gis_branch_id"]),
+                        review=r,
+                    )
+                )
+        except Exception:
+            logger.exception("Dataset CSV write failed (task=%s branch=%s)", task_id, data.get("gis_branch_id"))
 
         # Связь задача↔филиал
         await session.execute(

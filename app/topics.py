@@ -24,7 +24,7 @@ from typing import Iterable, Literal
 
 import pymorphy3
 
-# Optional heavy deps for the BERT fallback. Loaded lazily.
+# Optional heavy deps for embeddings fallback. Loaded lazily.
 # We intentionally avoid importing these unconditionally so the service can run
 # without ML deps (e.g. in minimal deployments).
 try:  # pylint: disable=import-error
@@ -33,12 +33,9 @@ except ImportError:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
 try:  # pylint: disable=import-error
-    import torch  # type: ignore
-    from transformers import AutoModel, AutoTokenizer  # type: ignore
+    from sentence_transformers import SentenceTransformer  # type: ignore
 except ImportError:  # pragma: no cover
-    torch = None  # type: ignore[assignment]
-    AutoModel = None  # type: ignore[assignment]
-    AutoTokenizer = None  # type: ignore[assignment]
+    SentenceTransformer = None  # type: ignore[assignment]
 
 # Ленивая инициализация — MorphAnalyzer создается 1 раз и переиспользуется.
 _morph: pymorphy3.MorphAnalyzer | None = None
@@ -342,66 +339,34 @@ def extract_topics(
     return top_problems, top_praise
 
 
-# ---------------------------------------------------------------------------
-# BERT embeddings fallback (semantic clustering)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_BERT_MODEL = "bert-base-multilingual-cased"
+_DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
 @lru_cache(maxsize=1)
-def _load_bert(model_name: str = _DEFAULT_BERT_MODEL):
-    if AutoTokenizer is None or AutoModel is None or torch is None:
-        raise RuntimeError("transformers/torch not installed")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    model.eval()
-    return tokenizer, model
+def _load_sentence_embedder(model_name: str = _DEFAULT_EMBED_MODEL):
+    if SentenceTransformer is None:
+        raise RuntimeError("sentence-transformers not installed")
+    # SentenceTransformer internally loads transformers/torch and caches weights.
+    return SentenceTransformer(model_name)
 
 
-def _mean_pool(last_hidden_state, attention_mask):
-    # last_hidden_state: (B, T, H)
-    # attention_mask: (B, T)
-    mask = attention_mask.unsqueeze(-1).type_as(last_hidden_state)
-    summed = (last_hidden_state * mask).sum(dim=1)
-    counts = mask.sum(dim=1).clamp(min=1)
-    return summed / counts
-
-
-def _embed_texts_bert(
+def _embed_texts_sentence_transformers(
     texts: list[str],
     *,
-    model_name: str = _DEFAULT_BERT_MODEL,
-    batch_size: int = 32,
-    max_length: int = 192,
+    model_name: str = _DEFAULT_EMBED_MODEL,
+    batch_size: int = 64,
 ):
-    if np is None or torch is None:
-        raise RuntimeError("numpy/torch not installed")
-    tokenizer, model = _load_bert(model_name)
-
-    device = torch.device("cpu")
-    model.to(device)
-
-    all_vecs: list[np.ndarray] = []
-    with torch.inference_mode():
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            enc = tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
-            out = model(**enc)
-            pooled = _mean_pool(out.last_hidden_state, enc["attention_mask"])
-            vec = pooled.detach().cpu().float().numpy()
-            # Normalize for cosine similarity.
-            norms = np.linalg.norm(vec, axis=1, keepdims=True)
-            vec = vec / np.clip(norms, 1e-12, None)
-            all_vecs.append(vec)
-    return np.vstack(all_vecs) if all_vecs else np.zeros((0, 0), dtype=np.float32)
+    if np is None:
+        raise RuntimeError("numpy not installed")
+    model = _load_sentence_embedder(model_name)
+    emb = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    # sentence-transformers may return list; normalize to np.ndarray
+    return np.asarray(emb, dtype=np.float32)
 
 
 @dataclass
@@ -444,41 +409,57 @@ def _cluster_embeddings_greedy(
     return clusters
 
 
-def _label_cluster(docs: list[ReviewDoc], idxs: list[int]) -> str:
-    """
-    Create a stable short label from the cluster texts using the existing
-    tokenizer+lemmatizer (so labels stay Russian/Kazakh terms, not embeddings).
-    """
-    term_counts: Counter[str] = Counter()
-    for i in idxs:
-        tokens = _normalize_tokens(_tokenize(docs[i].text or ""))
-        ngrams = _extract_ngrams(tokens)
-        term_counts.update(ngrams)
-    if not term_counts:
-        return "тема"
-    # Prefer bigrams if they are informative; otherwise take the top unigram.
-    for term, _ in term_counts.most_common(50):
-        if " " in term:
-            return term
-    return term_counts.most_common(1)[0][0]
+def _pick_representative_index(
+    emb: "np.ndarray",
+    idxs: list[int],
+    *,
+    centroid: "np.ndarray | None" = None,
+) -> int:
+    """Pick cluster medoid: the text closest to centroid by cosine (dot, since normalized)."""
+    if np is None:
+        raise RuntimeError("numpy not installed")
+    if not idxs:
+        return 0
+    if centroid is None:
+        centroid = emb[idxs].mean(axis=0)
+        centroid = centroid / max(float(np.linalg.norm(centroid)), 1e-12)
+    sims = emb[idxs] @ centroid
+    best_local = int(np.argmax(sims))
+    return idxs[best_local]
 
 
-def extract_topics_bert(
+def _label_from_representative_text(text: str) -> str:
+    """
+    Label based on the representative review only (not TF-IDF, not whole-cluster voting).
+    We still use tokenization+lemmatization to keep labels short and stable.
+    """
+    tokens = _normalize_tokens(_tokenize(text or ""))
+    if not tokens:
+        return (text or "").strip()[:48] or "тема"
+    ngrams = _extract_ngrams(tokens)
+    # Prefer a bigram if available (often captures aspect + qualifier).
+    for t in ngrams:
+        if " " in t:
+            return t
+    return tokens[0]
+
+
+def extract_topics_embeddings(
     reviews: list[ReviewDoc],
     *,
     top_n: int = 8,
     min_mentions: int = 3,
     example_quote_chars: int = 200,
-    model_name: str = _DEFAULT_BERT_MODEL,
+    model_name: str = _DEFAULT_EMBED_MODEL,
     sim_threshold: float = 0.60,
     max_docs_per_group: int = 2000,
 ) -> tuple[list[TopicResult], list[TopicResult]]:
     """
-    Semantic alternative to extract_topics() using BERT embeddings:
+    Semantic alternative to extract_topics() using sentence embeddings:
     - Split by rating group (neg vs pos)
-    - Embed each review text
+    - Embed each review text (multilingual MiniLM by default)
     - Greedy cosine clustering
-    - Label clusters using existing lemma/ngram extraction
+    - Label clusters by picking a representative review (medoid) and extracting a short term from it
     """
     if not reviews:
         return [], []
@@ -495,7 +476,7 @@ def extract_topics_bert(
         docs = docs[:max_docs_per_group]
 
         texts = [d.text for d in docs]
-        emb = _embed_texts_bert(texts, model_name=model_name)
+        emb = _embed_texts_sentence_transformers(texts, model_name=model_name)
         if emb.shape[0] == 0:
             return []
         clusters = _cluster_embeddings_greedy(emb, sim_threshold=sim_threshold)
@@ -506,10 +487,13 @@ def extract_topics_bert(
 
         out: list[TopicResult] = []
         for c in clusters:
-            label = _label_cluster(docs, c.idxs)
+            rep_idx = _pick_representative_index(emb, c.idxs, centroid=c.centroid)
+            rep_text = docs[rep_idx].text
+            label = _label_from_representative_text(rep_text)
             # Examples: first unique snippets from cluster
             examples: list[str] = []
-            for idx in c.idxs:
+            # Prefer representative first
+            for idx in [rep_idx, *c.idxs]:
                 if len(examples) >= 3:
                     break
                 snippet = _make_snippet(docs[idx].text, label, max_len=example_quote_chars)

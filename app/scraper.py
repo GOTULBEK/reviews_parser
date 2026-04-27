@@ -55,16 +55,16 @@ async def search_branches(
     # - page 1: /{city}/search/{query}
     # - page N: /{city}/search/{query}/page/{N}/
     safe_query = quote(query, safe="")
-    max_pages = 50  # safety cap to avoid infinite loops on markup changes
-
-    for page in range(1, max_pages + 1):
+    page = 1
+    while True:
         if len(ordered) >= max_branches:
             break
 
-        if page == 1:
-            search_url = f"{SITE_BASE}/{city}/search/{safe_query}"
-        else:
-            search_url = f"{SITE_BASE}/{city}/search/{safe_query}/page/{page}/"
+        search_url = (
+            f"{SITE_BASE}/{city}/search/{safe_query}"
+            if page == 1
+            else f"{SITE_BASE}/{city}/search/{safe_query}/page/{page}/"
+        )
 
         logger.info("Search request: %s", search_url)
 
@@ -75,7 +75,11 @@ async def search_branches(
             break
 
         if res.status_code != 200:
-            logger.error("Search HTTP %d: %s", res.status_code, res.text[:200])
+            # 404/410 usually means "page does not exist" (end of pagination).
+            if res.status_code in (404, 410):
+                logger.info("Search pagination ended at page=%d (HTTP %d)", page, res.status_code)
+            else:
+                logger.error("Search HTTP %d: %s", res.status_code, res.text[:200])
             break
 
         before = len(ordered)
@@ -90,6 +94,8 @@ async def search_branches(
         # Stop when page is empty (no new firm IDs).
         if len(ordered) == before:
             break
+
+        page += 1
 
     ordered = ordered[:max_branches]
     return [

@@ -157,3 +157,25 @@ class SearchTaskBranch(Base):
     branch_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("branches.id", ondelete="CASCADE"), primary_key=True
     )
+
+
+class TaskTopicsCache(Base):
+    """
+    Кэш результатов NLP/AI-анализа тем (topic extraction) для эндпоинта /overview.
+    Позволяет избежать повторного запуска дорогого алгоритма.
+    """
+    __tablename__ = "task_topics_cache"
+    __table_args__ = (UniqueConstraint("task_id", "days", name="uq_task_days_topics"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("search_tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    
+    top_problems: Mapped[list[dict] | None] = mapped_column(JSONB)
+    top_praise: Mapped[list[dict] | None] = mapped_column(JSONB)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
