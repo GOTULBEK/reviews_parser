@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.database import get_session
 from app.models.tasks import SearchTask, TaskStatus, SearchTaskBranch, TaskTopicsCache
 from app.models.core import Branch, Review
+from app.schemas.common import SourceType
 from app.schemas.dashboard import *
 from app.services import claude as claude_service
 from app.services.topics import ReviewDoc
@@ -51,17 +52,20 @@ def _run_topic_extraction_embeddings(docs):
     return extract_topics_embeddings(docs, top_n=8, min_mentions=3)
 
 async def _fetch_reviews_as_dicts(
-    task_id: UUID, session: AsyncSession, since: datetime | None = None
+    task_id: UUID, session: AsyncSession, since: datetime | None = None, source: Literal["2gis", "zapis", "all"] = "2gis"
 ) -> list[dict]:
     stmt = (
         select(Review.rating, Review.text)
         .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
         .where(SearchTaskBranch.task_id == task_id)
         .where(Review.text.isnot(None))
         .where(Review.text != "")
     )
     if since is not None:
         stmt = stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
+    if source is not None and source != "all":
+        stmt = stmt.where(Branch.source == source)
     rows = (await session.execute(stmt)).all()
     return [{"rating": r.rating, "text": r.text} for r in rows]
 
@@ -83,9 +87,10 @@ async def get_overview(
         alias="params",
         description="If set, all analytics are computed using reviews from the last N days (by date_created).",
     ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
     session: AsyncSession = Depends(get_session),
 ):
-    cache_key = (str(task_id), "overview", int(top_branches_limit), int(days) if days is not None else None)
+    cache_key = (str(task_id), "overview", int(top_branches_limit), int(days) if days is not None else None, source if source and source != "all" else None)
     now = monotonic()
 
     async with _overview_lock:
@@ -112,6 +117,9 @@ async def get_overview(
                 .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
                 .where(SearchTaskBranch.task_id == task_id)
             )
+            if source is not None and source != "all":
+                branches_stmt = branches_stmt.where(Branch.source == source)
+                
             branches = (await session.execute(branches_stmt)).scalars().all()
             branches_total = len(branches)
 
@@ -127,10 +135,13 @@ async def get_overview(
                 )
                 .select_from(Review)
                 .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+                .join(Branch, Branch.id == Review.branch_id)
                 .where(SearchTaskBranch.task_id == task_id)
             )
             if since is not None:
                 agg_stmt = agg_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
+            if source is not None and source != "all":
+                agg_stmt = agg_stmt.where(Branch.source == source)
             row = (await session.execute(agg_stmt)).one()
 
             reviews_total = row.total or 0
@@ -158,12 +169,16 @@ async def get_overview(
                 select(Review.rating, func.count().label("cnt"))
                 .select_from(Review)
                 .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+                .join(Branch, Branch.id == Review.branch_id)
                 .where(SearchTaskBranch.task_id == task_id)
                 .where(Review.rating.in_([1, 2, 3, 4, 5]))
                 .group_by(Review.rating)
             )
             if since is not None:
                 rating_stmt = rating_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
+            if source is not None and source != "all":
+                rating_stmt = rating_stmt.where(Branch.source == source)
+                
             rating_rows = (await session.execute(rating_stmt)).all()
             counts: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
             for r in rating_rows:
@@ -200,6 +215,7 @@ async def get_overview(
                 OverviewBranchItem(
                     branch_id=b.id,
                     gis_branch_id=str(b.gis_branch_id),
+                    source=b.source,
                     name=(b.name or "").strip() or f"Филиал {b.gis_branch_id}",
                     city=task.city,
                     address=(b.address or "").strip() or "Адрес не найден",
@@ -234,7 +250,7 @@ async def get_overview(
                 top_problems = [TopMention(**t) for t in topics_cache_row.top_problems] if topics_cache_row.top_problems else []
                 top_praise = [TopMention(**t) for t in topics_cache_row.top_praise] if topics_cache_row.top_praise else []
             else:
-                reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since)
+                reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
                 top_problems, top_praise = await claude_service.generate_top_mentions(reviews_dicts)
 
                 if not top_problems and not top_praise:
@@ -305,7 +321,7 @@ LEFT JOIN agg a USING (day)
 ORDER BY d.day ASC
 """
                     ),
-                    {"task_id": task_id, "tz": _OVERVIEW_TZ, "range_days": int(days)},
+                    {"task_id": task_id, "tz": _OVERVIEW_TZ, "range_days": int(days), "source": source if source and source != "all" else None},
                 )
 
                 review_dynamics_points = [
@@ -366,7 +382,7 @@ LEFT JOIN agg a USING (month_start)
 ORDER BY m.month_start ASC
 """
                     ).bindparams(bindparam("since", type_=DateTime(timezone=True))),
-                    {"task_id": task_id, "tz": _OVERVIEW_TZ, "since": since},
+                    {"task_id": task_id, "tz": _OVERVIEW_TZ, "since": since, "source": source if source and source != "all" else None},
                 )
 
                 review_dynamics_points = [
@@ -499,7 +515,7 @@ LEFT JOIN agg a
 ORDER BY g.branch_id, g.day ASC
 """
                         ),
-                        {"task_id": task_id, "tz": _OVERVIEW_TZ, "range_days": int(days)},
+                        {"task_id": task_id, "tz": _OVERVIEW_TZ, "range_days": int(days), "source": source if source and source != "all" else None},
                     )
                 else:
                     per_branch_dyn_result = await session.execute(
@@ -550,7 +566,7 @@ LEFT JOIN agg a
 ORDER BY g.branch_id, g.month_start ASC
 """
                         ).bindparams(bindparam("since", type_=DateTime(timezone=True))),
-                        {"task_id": task_id, "tz": _OVERVIEW_TZ, "since": since},
+                        {"task_id": task_id, "tz": _OVERVIEW_TZ, "since": since, "source": source if source and source != "all" else None},
                     )
 
                 per_branch_points: dict[str, list[ReviewDynamicsPoint]] = {}
@@ -664,21 +680,7 @@ def _run_topic_extraction_embeddings(docs):
     return extract_topics_embeddings(docs, top_n=8, min_mentions=3)
 
 
-async def _fetch_reviews_as_dicts(
-    task_id: UUID, session: AsyncSession, since: datetime | None = None
-) -> list[dict]:
-    """Returns all reviews for the task as plain dicts with 'rating' and 'text' keys."""
-    stmt = (
-        select(Review.rating, Review.text)
-        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
-        .where(SearchTaskBranch.task_id == task_id)
-        .where(Review.text.isnot(None))
-        .where(Review.text != "")
-    )
-    if since is not None:
-        stmt = stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-    rows = (await session.execute(stmt)).all()
-    return [{"rating": r.rating, "text": r.text} for r in rows]
+# removed duplicate _fetch_reviews_as_dicts
 
 # ---------------------------------------------------------------------------
 # Dashboard — /branches
@@ -708,6 +710,7 @@ async def get_task_branches(
         alias="params",
         description="If set, rating/total_reviews/replies_pct/rating_distribution are computed using reviews from the last N days (by date_created).",
     ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -755,6 +758,11 @@ async def get_task_branches(
         .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
         .where(SearchTaskBranch.task_id == task_id)
     )
+
+    if source is not None and source != "all":
+        stmt = stmt.where(Branch.source == source)
+        count_stmt = count_stmt.where(Branch.source == source)
+
     total = (await session.execute(count_stmt)).scalar_one()
 
     rows = (await session.execute(stmt)).all()
@@ -803,6 +811,7 @@ async def get_task_branches(
         items.append(BranchListItem(
             id=b.id,
             gis_branch_id=b.gis_branch_id,  # int → str via BranchIdStr
+            source=b.source,
             name=b.name,
             address=b.address,
             rating=(float(avg_rating) if avg_rating is not None else None) if since is not None else b.rating,
@@ -845,6 +854,7 @@ async def get_task_reviews(
         alias="params",
         description="If set, returns only reviews from the last N days (by date_created).",
     ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -875,6 +885,9 @@ async def get_task_reviews(
     if since is not None:
         where_clauses.append(Review.date_created.isnot(None))
         where_clauses.append(Review.date_created >= since)
+        
+    if source is not None and source != "all":
+        where_clauses.append(Branch.source == source)
 
     base_from = (
         Review.__table__
@@ -943,14 +956,42 @@ async def get_task_problems(
         alias="params",
         description="If set, problems are generated using reviews from the last N days (by date_created).",
     ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
     since: datetime | None = None
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
-    reviews = await _fetch_reviews_as_dicts(task_id, session, since=since)
-    problems = await claude_service.generate_problems(reviews)
+        
+    cache_stmt = select(TaskTopicsCache).where(
+        TaskTopicsCache.task_id == task_id,
+        TaskTopicsCache.days == (int(days) if days is not None else None)
+    )
+    topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+
+    if topics_cache_row is not None and topics_cache_row.problems is not None:
+        problems = [ProblemItem(**p) for p in topics_cache_row.problems]
+    else:
+        reviews = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
+        problems = await claude_service.generate_problems(reviews)
+        
+        if topics_cache_row is None:
+            new_cache = TaskTopicsCache(
+                task_id=task_id,
+                days=int(days) if days is not None else None,
+                problems=[p.model_dump() for p in problems]
+            )
+            session.add(new_cache)
+        else:
+            topics_cache_row.problems = [p.model_dump() for p in problems]
+            
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logging.exception("Failed to save problems cache")
+
     note = (
         "Generated by Claude AI based on negative/neutral reviews."
         if problems
@@ -982,14 +1023,45 @@ async def get_task_actions(
         alias="params",
         description="If set, actions are generated using reviews from the last N days (by date_created).",
     ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
     since: datetime | None = None
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
-    reviews = await _fetch_reviews_as_dicts(task_id, session, since=since)
-    priorities, insights = await claude_service.generate_actions(reviews)
+        
+    cache_stmt = select(TaskTopicsCache).where(
+        TaskTopicsCache.task_id == task_id,
+        TaskTopicsCache.days == (int(days) if days is not None else None)
+    )
+    topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+
+    if topics_cache_row is not None and topics_cache_row.priorities is not None and topics_cache_row.insights is not None:
+        priorities = [PriorityItem(**p) for p in topics_cache_row.priorities]
+        insights = [InsightItem(**i) for i in topics_cache_row.insights]
+    else:
+        reviews = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
+        priorities, insights = await claude_service.generate_actions(reviews)
+        
+        if topics_cache_row is None:
+            new_cache = TaskTopicsCache(
+                task_id=task_id,
+                days=int(days) if days is not None else None,
+                priorities=[p.model_dump() for p in priorities],
+                insights=[i.model_dump() for i in insights]
+            )
+            session.add(new_cache)
+        else:
+            topics_cache_row.priorities = [p.model_dump() for p in priorities]
+            topics_cache_row.insights = [i.model_dump() for i in insights]
+            
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logging.exception("Failed to save actions cache")
+
     return ActionsResponse(
         task_id=task.id,
         status=task.status.value,
@@ -1002,3 +1074,223 @@ async def get_task_actions(
 
 
 # ---------------------------------------------------------------------------
+# Dashboard — /compare
+# ---------------------------------------------------------------------------
+
+from app.models.core import Company
+
+@router.get(
+    "/{task_id}/compare",
+    response_model=CompareResponse,
+    tags=["dashboard"],
+    summary="Сравнение клубов (Target vs Competitors)",
+)
+async def get_compare(
+    task_id: UUID,
+    grouped: bool = Query(False, description="Если True, филиалы одной компании объединяются"),
+    session: AsyncSession = Depends(get_session),
+):
+    task = await _require_task(task_id, session)
+
+    target_branches = (
+        await session.execute(
+            select(Branch).join(SearchTaskBranch).where(SearchTaskBranch.task_id == task_id)
+        )
+    ).scalars().all()
+
+    if not target_branches:
+        raise HTTPException(status_code=404, detail="No branches found in task")
+
+    target_company_ids = {b.company_id for b in target_branches}
+    target_branch_ids = {b.id for b in target_branches}
+
+    # Build the full set of categories we want to match against competitors.
+    # Priority: multi-category array, then single legacy category, then task query.
+    target_categories: list[str] = []
+    for b in target_branches:
+        if b.categories:
+            target_categories.extend(b.categories)
+        elif b.category:
+            target_categories.append(b.category)
+    target_categories = list(dict.fromkeys(target_categories))  # dedupe, preserve order
+
+    target_city = next((b.city for b in target_branches if b.city), None)
+
+    if grouped:
+        stmt = (
+            select(
+                Company.id.label("company_id"),
+                Company.name.label("company_name"),
+                func.count(Review.id).label("reviews_n"),
+                func.count(Review.id).filter(Review.rating.in_([1, 2, 3, 4, 5])).label("rated_n"),
+                func.count(Review.id).filter(Review.rating <= 2).label("neg_n"),
+                func.count(Review.id).filter(Review.official_answer_text.isnot(None)).label("replied_n"),
+                func.avg(Review.rating).filter(Review.rating.isnot(None)).label("avg_rating"),
+                func.array_agg(Branch.categories).label("categories_agg")
+            )
+            .select_from(Company)
+            .join(Branch, Branch.company_id == Company.id)
+            .outerjoin(Review, Review.branch_id == Branch.id)
+        )
+        if target_categories:
+            from sqlalchemy.dialects.postgresql import ARRAY as PGARRAY
+            stmt = stmt.where(
+                or_(
+                    Branch.categories.overlap(target_categories),
+                    Branch.category.in_(target_categories),
+                    Branch.id.in_(target_branch_ids)
+                )
+            )
+        if target_city:
+            stmt = stmt.where(Branch.city == target_city)
+        stmt = stmt.group_by(Company.id, Company.name)
+    else:
+        stmt = (
+            select(
+                Branch,
+                Company.name.label("company_name"),
+                func.count(Review.id).label("reviews_n"),
+                func.count(Review.id).filter(Review.rating.in_([1, 2, 3, 4, 5])).label("rated_n"),
+                func.count(Review.id).filter(Review.rating <= 2).label("neg_n"),
+                func.count(Review.id).filter(Review.official_answer_text.isnot(None)).label("replied_n"),
+                func.avg(Review.rating).filter(Review.rating.isnot(None)).label("avg_rating")
+            )
+            .select_from(Branch)
+            .join(Company, Company.id == Branch.company_id)
+            .outerjoin(Review, Review.branch_id == Branch.id)
+        )
+        if target_categories:
+            stmt = stmt.where(
+                or_(
+                    Branch.categories.overlap(target_categories),
+                    Branch.category.in_(target_categories),
+                    Branch.id.in_(target_branch_ids)
+                )
+            )
+        if target_city:
+            stmt = stmt.where(Branch.city == target_city)
+        stmt = stmt.group_by(Branch.id, Company.name)
+
+    rows = (await session.execute(stmt)).all()
+
+    competitors_data = []
+    total_rating = 0.0
+    total_rated_companies = 0
+    total_neg_pct = 0.0
+    total_companies = 0
+
+    for row in rows:
+        reviews_n = row.reviews_n or 0
+        rated_n = row.rated_n or 0
+        neg_n = row.neg_n or 0
+        replied_n = row.replied_n or 0
+        avg_rating = float(row.avg_rating) if row.avg_rating is not None else None
+        
+        neg_pct = (neg_n / rated_n * 100) if rated_n > 0 else 0.0
+        replies_pct = (replied_n / reviews_n * 100) if reviews_n > 0 else 0.0
+        
+        if avg_rating is not None:
+            total_rating += avg_rating
+            total_rated_companies += 1
+        total_neg_pct += neg_pct
+        total_companies += 1
+        
+        if grouped:
+            comp_id = row.company_id
+            is_target = comp_id in target_company_ids
+            name = row.company_name
+            address = None
+            branch_id = None
+            # Flatten array of arrays
+            cats_raw = row.categories_agg or []
+            cats_set = set()
+            for sublist in cats_raw:
+                if sublist:
+                    cats_set.update(sublist)
+            categories = sorted(list(cats_set))
+        else:
+            b = row.Branch
+            branch_id = b.id
+            is_target = branch_id in target_branch_ids
+            name = b.name or row.company_name
+            address = b.address
+            categories = b.categories or []
+            
+        competitors_data.append({
+            "branch_id": branch_id,
+            "is_target": is_target,
+            "name": name,
+            "address": address,
+            "rating": round(avg_rating, 2) if avg_rating else None,
+            "reviews_total": reviews_n,
+            "negative_pct": round(neg_pct, 1),
+            "replies_pct": round(replies_pct, 1),
+            "dynamics": 0.0, # Placeholder dynamics
+            "categories": categories
+        })
+
+    # Sort by rating (desc) and reviews_total (desc)
+    competitors_data.sort(key=lambda x: (x["rating"] or -1.0, x["reviews_total"]), reverse=True)
+
+    # Assign rank
+    for i, comp in enumerate(competitors_data):
+        comp["rank"] = i + 1
+
+    # Calculate KPIs
+    market_avg_rating = total_rating / total_rated_companies if total_rated_companies > 0 else 0.0
+    market_avg_neg_pct = total_neg_pct / total_companies if total_companies > 0 else 0.0
+
+    target_comps = [c for c in competitors_data if c["is_target"]]
+    if not target_comps:
+        raise HTTPException(status_code=404, detail="Target not found in calculated competitors")
+
+    best_target = target_comps[0] # Highest ranked target
+    best_rating_diff = None
+    if best_target["rating"] is not None and market_avg_rating > 0:
+        best_rating_diff = round(best_target["rating"] - market_avg_rating, 1)
+
+    replies_sorted = sorted(competitors_data, key=lambda x: x["replies_pct"], reverse=True)
+    replies_rank = next((i + 1 for i, c in enumerate(replies_sorted) if c["is_target"]), 0)
+
+    kpis = CompareKPIs(
+        rank_in_district=best_target["rank"],
+        total_competitors=len(competitors_data),
+        best_rating=best_target["rating"],
+        best_rating_diff_from_avg=best_rating_diff,
+        negative_pct=round(best_target["negative_pct"], 1),
+        negative_pct_avg=round(market_avg_neg_pct, 1),
+        replies_pct=round(best_target["replies_pct"], 1),
+        replies_rank=replies_rank
+    )
+
+    # Strengths
+    strengths = []
+    if best_target["rating"] is not None and best_target["rank"] <= 3:
+        strengths.append(CompareStrengthItem(
+            label="Рейтинг",
+            value=f"{best_target['rating']} / 5.0",
+            subtext="Лучший показатель среди конкурентов." if best_target["rank"] == 1 else "Один из лучших рейтингов в районе.",
+            meter_pct=92 if best_target["rank"] == 1 else 78
+        ))
+
+    # Check TaskTopicsCache for top_praise
+    cache_stmt = select(TaskTopicsCache).where(TaskTopicsCache.task_id == task_id)
+    cache = (await session.execute(cache_stmt)).scalars().first()
+    if cache and cache.top_praise:
+        for praise in cache.top_praise[:2]:
+            mentions = praise.get("mentions", 0)
+            strengths.append(CompareStrengthItem(
+                label=praise.get("label", "Похвала").capitalize(),
+                value=f"{mentions} упоминаний",
+                subtext="Одна из ключевых причин высокой оценки.",
+                meter_pct=min(100, 60 + mentions * 2)
+            ))
+
+    response = CompareResponse(
+        task_id=task_id,
+        status=task.status.value,
+        kpis=kpis,
+        competitors=[CompareCompetitorItem(**c) for c in competitors_data],
+        strengths=strengths
+    )
+    return response

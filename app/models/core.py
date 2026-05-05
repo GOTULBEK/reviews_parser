@@ -11,8 +11,9 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -31,14 +32,19 @@ class Company(Base):
 
 class Branch(Base):
     __tablename__ = "branches"
+    __table_args__ = (UniqueConstraint("gis_branch_id", "source", name="uq_gis_branch_id_source"),)
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     gis_branch_id: Mapped[int] = mapped_column(
-        BigInteger, unique=True, nullable=False, index=True
+        BigInteger, nullable=False, index=True
     )
+    source: Mapped[str] = mapped_column(String(64), nullable=False, server_default="2gis")
     company_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    city: Mapped[str | None] = mapped_column(String(64), index=True)
+    category: Mapped[str | None] = mapped_column(String(128), index=True)
+    categories: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, server_default='{}')
     name: Mapped[str | None] = mapped_column(String(512))
     address: Mapped[str | None] = mapped_column(String(1024))
     rating: Mapped[float | None] = mapped_column(Float)

@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 from pydantic import BaseModel
-from .common import BranchIdStr
+from .common import BranchIdStr, SourceType
 
 Sentiment = Literal["pos", "neg", "neu", "unknown"]
 
@@ -36,6 +36,7 @@ class RatingDistribution(BaseModel):
 class OverviewBranchItem(BaseModel):
     branch_id: UUID
     gis_branch_id: BranchIdStr
+    source: SourceType
     name: str
     city: str
     address: str
@@ -96,6 +97,7 @@ class OverviewResponse(BaseModel):
 class BranchListItem(BaseModel):
     id: UUID
     gis_branch_id: BranchIdStr
+    source: SourceType
     name: str | None = None
     address: str | None = None
     rating: float | None = None
@@ -162,3 +164,40 @@ class ActionsResponse(BaseModel):
     priorities: list[PriorityItem] = []
     insights: list[InsightItem] = []
     analytics_note: str | None = None
+
+class CompareCompetitorItem(BaseModel):
+    rank: int
+    branch_id: UUID | None = None
+    is_target: bool
+    name: str
+    address: str | None = None
+    rating: float | None = None
+    reviews_total: int
+    negative_pct: float
+    replies_pct: float
+    dynamics: float | None = None
+    categories: list[str] = []
+
+class CompareKPIs(BaseModel):
+    rank_in_district: int
+    total_competitors: int
+    best_rating: float | None = None
+    best_rating_diff_from_avg: float | None = None
+    negative_pct: float
+    negative_pct_avg: float
+    replies_pct: float
+    replies_rank: int
+
+class CompareStrengthItem(BaseModel):
+    label: str
+    value: str
+    subtext: str | None = None
+    meter_pct: int
+
+class CompareResponse(BaseModel):
+    task_id: UUID
+    status: str
+    kpis: CompareKPIs
+    competitors: list[CompareCompetitorItem]
+    strengths: list[CompareStrengthItem]
+

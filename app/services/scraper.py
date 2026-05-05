@@ -74,6 +74,10 @@ async def search_branches(
             logger.error("Search HTTP error: %s", e)
             break
 
+        if "/museum" in str(res.url):
+            logger.error("2GIS Captcha (museum) triggered for %s!", search_url)
+            raise RuntimeError("2GIS Captcha triggered (Bot detection). Try again later.")
+
         if res.status_code != 200:
             # 404/410 usually means "page does not exist" (end of pagination).
             if res.status_code in (404, 410):
@@ -166,21 +170,43 @@ def _extract_address_from_soup(soup: BeautifulSoup) -> str:
     return ", ".join(parts) if parts else "Адрес не найден"
 
 
-def _extract_name_from_soup(soup: BeautifulSoup) -> str | None:
+def _extract_name_and_categories_from_soup(soup: BeautifulSoup) -> tuple[str | None, str | None, list[str]]:
     """
-    Извлекает название фирмы. Каскад источников от чистых к грязным.
-    Если все дают None — возвращаем None, вызывающий код выберет заглушку.
+    Извлекает название фирмы, первичную категорию (legacy) и список всех рубрик.
+    Рубрики берутся из <span class="_3yxk2u"> — элементы на странице фирмы 2ГИС.
     """
-    # 1. og:title — обычно чистая строка вида "Underground gym, фитнес-клуб"
+    _ADDR_KEYWORDS = ["улица", "ул.", "проспект", "пр.", "микрорайон", "мкр.", "шоссе", "тракт", "переулок", "квартал", "район", "д."]
+
+    def _is_address_like(s: str) -> bool:
+        return any(kw in s.lower() for kw in _ADDR_KEYWORDS) or any(c.isdigit() for c in s)
+
+    # ---- Extract all rubrics from DOM (<span class="_3yxk2u">) ----
+    rubric_spans = soup.find_all("span", class_="_3yxk2u")
+    categories: list[str] = []
+    for span in rubric_spans:
+        text = span.get_text(strip=True)
+        if text and not _is_address_like(text):
+            categories.append(text)
+
+    # ---- Extract name + fallback primary category from og:title ----
     og = soup.find("meta", attrs={"property": "og:title"}) or soup.find(
         "meta", attrs={"name": "og:title"}
     )
     if og and og.get("content"):
         value = og["content"].strip()
         if value:
-            return _strip_2gis_suffix(value)
+            stripped = _strip_2gis_suffix(value)
+            parts = [p.strip() for p in stripped.split(", ")]
+            name = parts[0]
+            category = parts[1] if len(parts) > 1 else None
+            if category and _is_address_like(category):
+                category = None
+            # If we have rubrics from DOM, use first rubric as primary category
+            if categories:
+                category = categories[0]
+            return name, category, categories
 
-    # 2. JSON-LD schema.org Organization/LocalBusiness
+    # 2. JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         if not script.string:
             continue
@@ -193,20 +219,37 @@ def _extract_name_from_soup(soup: BeautifulSoup) -> str | None:
             if isinstance(c, dict) and c.get("name"):
                 name = str(c["name"]).strip()
                 if name:
-                    return name
+                    category = categories[0] if categories else None
+                    return name, category, categories
 
-    # 3. h1 — часто есть, но может содержать хлебные крошки
+    # 3. h1
     h1 = soup.find("h1")
     if h1:
         text = h1.get_text(strip=True)
         if text:
-            return text
+            category = categories[0] if categories else None
+            return text, category, categories
 
-    # 4. <title> — самый грязный вариант: "NAME в Городе на адресе — отзывы — 2GIS"
+    # 4. <title>
     if soup.title and soup.title.string:
-        return _strip_2gis_suffix(soup.title.string.strip())
+        stripped = _strip_2gis_suffix(soup.title.string.strip())
+        parts = [p.strip() for p in stripped.split(", ")]
+        name = parts[0]
+        category = parts[1] if len(parts) > 1 else None
+        if category and _is_address_like(category):
+            category = None
+        if categories:
+            category = categories[0]
+        return name, category, categories
 
-    return None
+    return None, None, categories
+
+
+# Keep old name as alias for backward-compat callers
+def _extract_name_and_category_from_soup(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    name, category, _ = _extract_name_and_categories_from_soup(soup)
+    return name, category
+
 
 
 def _strip_2gis_suffix(value: str) -> str:
@@ -220,12 +263,13 @@ def _strip_2gis_suffix(value: str) -> str:
     return value
 
 
-async def scrape_branch_address(client: httpx.AsyncClient, firm_url: str) -> str:
-    """Обертка для обратной совместимости: одна сетевая загрузка + извлечение адреса."""
+async def scrape_branch_info(client: httpx.AsyncClient, firm_url: str) -> tuple[str | None, str | None, str, list[str]]:
+    """Обертка для одной сетевой загрузки + извлечение имени, категорий и адреса."""
     soup = await _fetch_firm_soup(client, firm_url)
     if soup is None:
-        return "Адрес не найден"
-    return _extract_address_from_soup(soup)
+        return None, None, "Адрес не найден", []
+    name, category, categories = _extract_name_and_categories_from_soup(soup)
+    return name, category, _extract_address_from_soup(soup), categories
 
 
 async def scrape_branch_preview(
@@ -241,13 +285,16 @@ async def scrape_branch_preview(
             "gis_branch_id": gis_branch_id,
             "firm_url": _normalize_firm_url(firm_url),
             "name": None,
+            "category": None,
             "address": "Адрес не найден",
         }
 
+    name, category = _extract_name_and_category_from_soup(soup)
     return {
         "gis_branch_id": gis_branch_id,
         "firm_url": _normalize_firm_url(firm_url),
-        "name": _extract_name_from_soup(soup),
+        "name": name,
+        "category": category,
         "address": _extract_address_from_soup(soup),
     }
 
@@ -336,13 +383,13 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
     Скрапит адрес + распределение рейтинга + все отзывы одного филиала.
     Возвращает словарь, готовый для upsert в БД.
     """
-    address, distribution = await asyncio.gather(
-        scrape_branch_address(client, firm_url),
+    (name, category, address, categories), distribution = await asyncio.gather(
+        scrape_branch_info(client, firm_url),
         fetch_rating_distribution(client, gis_branch_id),
     )
 
     all_reviews: list[dict] = []
-    company_name: str | None = None
+    company_name: str | None = name
     final_rating: float | None = None
     final_total: int | None = None
 
@@ -405,6 +452,8 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
     return {
         "gis_branch_id": gis_branch_id,
         "company_name": company_name,
+        "category": category,
+        "categories": categories,
         "address": address,
         "rating": final_rating,
         "total_reviews": final_total,

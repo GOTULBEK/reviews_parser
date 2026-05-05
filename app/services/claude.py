@@ -1,6 +1,12 @@
 import logging
 from typing import Any
+
+import anthropic
 from anthropic import AsyncAnthropic
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pydantic import ValidationError
+from fastapi import HTTPException
+
 from app.core.config import settings
 from app.schemas.dashboard import InsightItem, ProblemItem, PriorityItem, TopMention
 
@@ -17,7 +23,27 @@ def _format_reviews_for_prompt(reviews: list[dict]) -> str:
         if r.get('text'):
             rating = r.get('rating') or '?'
             lines.append(f"[Rating: {rating}/5] {r['text']}")
+            lines.append(f"[Rating: {rating}/5] {r['text']}")
     return "\n".join(lines)
+
+
+def _extract_tool_input(response) -> dict | None:
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use":
+            return block.input
+    logger.warning("Claude did not return a tool_use block. Content: %s", response.content)
+    return None
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((anthropic.RateLimitError, anthropic.APIError, anthropic.APIConnectionError)),
+    reraise=True
+)
+async def _call_anthropic(**kwargs):
+    if not client:
+        raise ValueError("Anthropic client is not initialized")
+    return await client.messages.create(**kwargs)
 
 
 async def generate_problems(reviews: list[dict]) -> list[ProblemItem]:
@@ -64,7 +90,7 @@ async def generate_problems(reviews: list[dict]) -> list[ProblemItem]:
     }
 
     try:
-        response = await client.messages.create(
+        response = await _call_anthropic(
             model=settings.claude_model,
             max_tokens=2048,
             temperature=0.2,
@@ -74,18 +100,21 @@ async def generate_problems(reviews: list[dict]) -> list[ProblemItem]:
             tool_choice={"type": "tool", "name": "extract_problems"}
         )
 
-        # Extract the tool use block
-        tool_use = next(block for block in response.content if block.type == "tool_use")
+        data = _extract_tool_input(response)
+        if not data:
+            return []
         
-        # Parse into Pydantic models
         problems = []
-        for item in tool_use.input.get("items", []):
-            problems.append(ProblemItem(**item))
+        for item in data.get("items", []):
+            try:
+                problems.append(ProblemItem(**item))
+            except ValidationError as e:
+                logger.warning(f"Skipping malformed problem item: {item}. Error: {e}")
         return problems
 
     except Exception as e:
         logger.exception("Claude API failed during problem extraction")
-        return []
+        raise HTTPException(status_code=503, detail="AI service is currently unavailable. Please try again later.")
 
 
 async def generate_actions(reviews: list[dict]) -> tuple[list[PriorityItem], list[InsightItem]]:
@@ -135,7 +164,7 @@ async def generate_actions(reviews: list[dict]) -> tuple[list[PriorityItem], lis
     }
 
     try:
-        response = await client.messages.create(
+        response = await _call_anthropic(
             model=settings.claude_model,
             max_tokens=2500,
             temperature=0.3,
@@ -145,17 +174,29 @@ async def generate_actions(reviews: list[dict]) -> tuple[list[PriorityItem], lis
             tool_choice={"type": "tool", "name": "extract_actions_and_insights"}
         )
 
-        tool_use = next(block for block in response.content if block.type == "tool_use")
-        data = tool_use.input
+        data = _extract_tool_input(response)
+        if not data:
+            return [], []
         
-        priorities = [PriorityItem(**p) for p in data.get("priorities", [])]
-        insights = [InsightItem(**i) for i in data.get("insights", [])]
+        priorities = []
+        for p in data.get("priorities", []):
+            try:
+                priorities.append(PriorityItem(**p))
+            except ValidationError as e:
+                logger.warning(f"Skipping malformed priority item: {p}. Error: {e}")
+                
+        insights = []
+        for i in data.get("insights", []):
+            try:
+                insights.append(InsightItem(**i))
+            except ValidationError as e:
+                logger.warning(f"Skipping malformed insight item: {i}. Error: {e}")
         
         return priorities, insights
 
     except Exception as e:
         logger.exception("Claude API failed during action extraction")
-        return [], []
+        raise HTTPException(status_code=503, detail="AI service is currently unavailable. Please try again later.")
 
 
 async def generate_top_mentions(
@@ -238,7 +279,7 @@ async def generate_top_mentions(
     }
 
     try:
-        response = await client.messages.create(
+        response = await _call_anthropic(
             model=settings.claude_model,
             max_tokens=2048,
             temperature=0.2,
@@ -262,11 +303,24 @@ async def generate_top_mentions(
             tool_choice={"type": "tool", "name": "extract_top_mentions"},
         )
 
-        tool_use = next(block for block in response.content if block.type == "tool_use")
-        data = tool_use.input
+        data = _extract_tool_input(response)
+        if not data:
+            return [], []
 
-        top_problems = [TopMention(**item) for item in data.get("top_problems", [])]
-        top_praise = [TopMention(**item) for item in data.get("top_praise", [])]
+        top_problems = []
+        for item in data.get("top_problems", []):
+            try:
+                top_problems.append(TopMention(**item))
+            except ValidationError as e:
+                logger.warning(f"Skipping malformed top_problem: {item}. Error: {e}")
+                
+        top_praise = []
+        for item in data.get("top_praise", []):
+            try:
+                top_praise.append(TopMention(**item))
+            except ValidationError as e:
+                logger.warning(f"Skipping malformed top_praise: {item}. Error: {e}")
+                
         return top_problems, top_praise
 
     except Exception:

@@ -122,7 +122,7 @@ def build_place_row(*, task_id: str, city: str, branch_data: dict[str, Any]) -> 
         "longitude": None,
         "rating_avg": branch_data.get("rating"),
         "reviews_count": branch_data.get("total_reviews"),
-        "source": "2gis",
+        "source": branch_data.get("source", "2gis"),
         "place_url": branch_data.get("url"),
         "rating_distribution_json": branch_data.get("rating_distribution"),
         "company_name": company_name,
@@ -163,7 +163,7 @@ def build_review_row(*, task_id: str, place_id: int, review: dict[str, Any]) -> 
         "stars": review.get("rating"),
         "review_date": review.get("date_created"),
         "language": lang,
-        "source": "2gis",
+        "source": review.get("source", "2gis"),
         # optional-if-exists
         "review_title": _raw_get(raw, "title") or _raw_get(raw, "review_title"),
         "author_name": review.get("user_name") or _raw_get(raw, "user", "name"),

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.dataset import append_place_row, append_review_row, build_place_row, build_review_row
 from app.db.database import AsyncSessionLocal
 from app.models import Branch, Company, Review, SearchTask, SearchTaskBranch, TaskStatus
-from app.services.scraper import scrape_branch
+from app.services import scraper, zapis_scraper
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +63,23 @@ async def _seed_task_branches(
                 gis_branch_id=int(b["gis_branch_id"]),
                 company_id=unknown_company_id,
                 url=b["firm_url"],
+                city=b.get("city"),
+                source=b.get("source", "2gis")
             )
             .on_conflict_do_update(
-                index_elements=["gis_branch_id"],
+                index_elements=["gis_branch_id", "source"],
                 set_={"url": b["firm_url"]},
             )
         )
         await session.execute(stmt)
 
     gis_ids = [int(b["gis_branch_id"]) for b in branches]
-    result = await session.execute(select(Branch).where(Branch.gis_branch_id.in_(gis_ids)))
+    sources = [b.get("source", "2gis") for b in branches]
+    
+    result = await session.execute(select(Branch).where(
+        Branch.gis_branch_id.in_(gis_ids),
+        Branch.source.in_(sources)
+    ))
     existing = result.scalars().all()
 
     for br in existing:
@@ -85,9 +92,15 @@ async def _seed_task_branches(
 
 async def _upsert_branch(session: AsyncSession, data: dict, company_id: UUID) -> Branch:
     now = datetime.now(tz=timezone.utc)
+    source = data.get("source", "2gis")
+    gis_branch_id_int = int(data["gis_branch_id"])
     values = {
-        "gis_branch_id": data["gis_branch_id"],
+        "gis_branch_id": gis_branch_id_int,
         "company_id": company_id,
+        "source": source,
+        "city": data.get("city"),
+        "category": data.get("category"),
+        "categories": data.get("categories") or [],
         "name": data.get("company_name"),
         "address": data.get("address"),
         "rating": data.get("rating"),
@@ -100,10 +113,14 @@ async def _upsert_branch(session: AsyncSession, data: dict, company_id: UUID) ->
         pg_insert(Branch)
         .values(**values)
         .on_conflict_do_update(
-            index_elements=["gis_branch_id"],
+            index_elements=["gis_branch_id", "source"],
             set_={
+                "company_id": values["company_id"],
                 "name": values["name"],
                 "address": values["address"],
+                "city": values["city"],
+                "category": values["category"],
+                "categories": values["categories"],
                 "rating": values["rating"],
                 "total_reviews": values["total_reviews"],
                 "url": values["url"],
@@ -114,16 +131,23 @@ async def _upsert_branch(session: AsyncSession, data: dict, company_id: UUID) ->
     )
     await session.execute(stmt)
     result = await session.execute(
-        select(Branch).where(Branch.gis_branch_id == data["gis_branch_id"])
+        select(Branch).where(
+            Branch.gis_branch_id == gis_branch_id_int,
+            Branch.source == source
+        )
     )
     return result.scalar_one()
 
 
 async def _upsert_reviews(session: AsyncSession, reviews: list[dict], branch_id: UUID) -> int:
-    """Upsert по gis_review_id. Обновляет текст/рейтинг/даты/ответ на случай редактирования."""
+    """Upsert по gis_review_id. Обновляет текст/рейтинг/даты/ответ на случай редактирования.
+    Возвращает только кол-во *новых* отзывов (не обновлений), чтобы не раздувать
+    total_reviews_collected при повторном скрапинге.
+    """
     if not reviews:
         return 0
 
+    inserted = 0
     for r in reviews:
         values = {
             "gis_review_id": r["gis_review_id"],
@@ -157,9 +181,14 @@ async def _upsert_reviews(session: AsyncSession, reviews: list[dict], branch_id:
                     "raw": values["raw"],
                 },
             )
+            # xmax == 0 means a fresh INSERT; non-zero means an UPDATE was performed.
+            .returning(Review.id, text("xmax"))
         )
-        await session.execute(stmt)
-    return len(reviews)
+        result = await session.execute(stmt)
+        row = result.one()
+        if row[1] == 0:  # xmax == 0 → new row was inserted
+            inserted += 1
+    return inserted
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +202,20 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
     async with AsyncSessionLocal() as session:
         task = await session.get(SearchTask, task_id)
         task_city = task.city if task is not None else ""
+        task_query = task.query if task is not None else ""
+        
+        data["city"] = task_city
+        # Always inject the search query into the categories array so that
+        # branches discovered under different rubric names (e.g. "Тренажёрные залы"
+        # vs "Фитнес-клуб") still match each other when the task query is the same.
+        if task_query:
+            existing_cats = list(data.get("categories") or [])
+            q = task_query.strip()
+            if q and q not in existing_cats:
+                existing_cats.append(q)
+            data["categories"] = existing_cats
+        if not data.get("category") and task_query:
+            data["category"] = task_query
 
         company = await _upsert_company(session, company_name)
         await session.flush()
@@ -189,6 +232,7 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
                     build_place_row(task_id=str(task_id), city=task_city, branch_data=data)
                 )
                 for r in data.get("reviews", []) or []:
+                    r["source"] = data.get("source", "2gis")
                     await append_review_row(
                         build_review_row(
                             task_id=str(task_id),
@@ -255,7 +299,11 @@ async def run_scrape_task(task_id: UUID, branches: list[dict]) -> None:
             async def process_one(entry: dict) -> None:
                 async with sem:
                     try:
-                        data = await scrape_branch(client, entry["gis_branch_id"], entry["firm_url"])
+                        if entry.get("source", "2gis") == "2gis":
+                            data = await scraper.scrape_branch(client, entry["gis_branch_id"], entry["firm_url"])
+                        else:
+                            data = await zapis_scraper.scrape_branch(client, str(entry["gis_branch_id"]), entry["firm_url"])
+                        data["source"] = entry.get("source", "2gis")
                     except Exception as e:
                         logger.exception("Scrape failed for branch %s: %s", entry["gis_branch_id"], e)
                         return

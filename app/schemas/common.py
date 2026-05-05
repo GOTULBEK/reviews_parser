@@ -12,3 +12,9 @@ def _coerce_branch_id_to_str(v) -> str:
 from pydantic import BeforeValidator
 
 BranchIdStr = Annotated[str, BeforeValidator(_coerce_branch_id_to_str)]
+
+import enum
+
+class SourceType(str, enum.Enum):
+    twogis = "2gis"
+    zapis = "zapis"

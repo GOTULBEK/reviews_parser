@@ -29,6 +29,7 @@ class SearchTask(Base):
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     query: Mapped[str | None] = mapped_column(String(512))
     city: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, server_default="2gis")
     status: Mapped[TaskStatus] = mapped_column(
         SAEnum(TaskStatus, name="task_status"), nullable=False, default=TaskStatus.pending
     )
@@ -67,6 +68,9 @@ class TaskTopicsCache(Base):
     
     top_problems: Mapped[list[dict] | None] = mapped_column(JSONB)
     top_praise: Mapped[list[dict] | None] = mapped_column(JSONB)
+    problems: Mapped[list[dict] | None] = mapped_column(JSONB)
+    priorities: Mapped[list[dict] | None] = mapped_column(JSONB)
+    insights: Mapped[list[dict] | None] = mapped_column(JSONB)
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
