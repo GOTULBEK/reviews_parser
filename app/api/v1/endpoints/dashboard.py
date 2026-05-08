@@ -294,11 +294,16 @@ async def get_overview(
                 ]
 
             from app.models.tasks import TaskTopicsCache
-            cache_stmt = select(TaskTopicsCache).where(
-                TaskTopicsCache.task_id == task_id,
-                TaskTopicsCache.days == (int(days) if days is not None else None)
+            cache_stmt = (
+                select(TaskTopicsCache)
+                .where(
+                    TaskTopicsCache.task_id == task_id,
+                    TaskTopicsCache.days == (int(days) if days is not None else None),
+                )
+                .order_by(TaskTopicsCache.id.desc())
+                .limit(1)
             )
-            topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+            topics_cache_row = (await session.execute(cache_stmt)).scalars().first()
 
             top_problems: list[TopMention] = []
             top_praise: list[TopMention] = []
@@ -1034,11 +1039,16 @@ async def get_task_problems(
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
         
-    cache_stmt = select(TaskTopicsCache).where(
-        TaskTopicsCache.task_id == task_id,
-        TaskTopicsCache.days == (int(days) if days is not None else None)
+    cache_stmt = (
+        select(TaskTopicsCache)
+        .where(
+            TaskTopicsCache.task_id == task_id,
+            TaskTopicsCache.days == (int(days) if days is not None else None),
+        )
+        .order_by(TaskTopicsCache.id.desc())
+        .limit(1)
     )
-    topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+    topics_cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     if topics_cache_row is not None and topics_cache_row.problems is not None:
         problems = [ProblemItem(**p) for p in topics_cache_row.problems]
@@ -1101,11 +1111,16 @@ async def get_task_actions(
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
         
-    cache_stmt = select(TaskTopicsCache).where(
-        TaskTopicsCache.task_id == task_id,
-        TaskTopicsCache.days == (int(days) if days is not None else None)
+    cache_stmt = (
+        select(TaskTopicsCache)
+        .where(
+            TaskTopicsCache.task_id == task_id,
+            TaskTopicsCache.days == (int(days) if days is not None else None),
+        )
+        .order_by(TaskTopicsCache.id.desc())
+        .limit(1)
     )
-    topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+    topics_cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     if topics_cache_row is not None and topics_cache_row.priorities is not None and topics_cache_row.insights is not None:
         priorities = [PriorityItem(**p) for p in topics_cache_row.priorities]
@@ -1169,11 +1184,16 @@ async def get_task_recommendations(
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
 
-    cache_stmt = select(TaskTopicsCache).where(
-        TaskTopicsCache.task_id == task_id,
-        TaskTopicsCache.days == (int(days) if days is not None else None),
+    cache_stmt = (
+        select(TaskTopicsCache)
+        .where(
+            TaskTopicsCache.task_id == task_id,
+            TaskTopicsCache.days == (int(days) if days is not None else None),
+        )
+        .order_by(TaskTopicsCache.id.desc())
+        .limit(1)
     )
-    cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+    cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     if cache_row is not None and cache_row.recommendations is not None:
         items = [RecommendationItem(**r) for r in cache_row.recommendations]
@@ -1280,11 +1300,16 @@ async def get_task_topics_module(
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
 
-    cache_stmt = select(TaskTopicsCache).where(
-        TaskTopicsCache.task_id == task_id,
-        TaskTopicsCache.days == (int(days) if days is not None else None),
+    cache_stmt = (
+        select(TaskTopicsCache)
+        .where(
+            TaskTopicsCache.task_id == task_id,
+            TaskTopicsCache.days == (int(days) if days is not None else None),
+        )
+        .order_by(TaskTopicsCache.id.desc())
+        .limit(1)
     )
-    cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+    cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     cached: dict | None = None
     if cache_row is not None and cache_row.topics_module is not None:
@@ -1625,11 +1650,16 @@ async def get_task_replies_module(
         )
 
     # Templates — Claude-generated and cached per (task_id, days).
-    cache_stmt = select(TaskTopicsCache).where(
-        TaskTopicsCache.task_id == task_id,
-        TaskTopicsCache.days == (int(days) if days is not None else None),
+    cache_stmt = (
+        select(TaskTopicsCache)
+        .where(
+            TaskTopicsCache.task_id == task_id,
+            TaskTopicsCache.days == (int(days) if days is not None else None),
+        )
+        .order_by(TaskTopicsCache.id.desc())
+        .limit(1)
     )
-    cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+    cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     templates: list[ReplyTemplate] = []
     if cache_row is not None and cache_row.reply_templates:
