@@ -47,9 +47,32 @@ def _format_reviews_for_prompt(reviews: list[dict]) -> str:
 def _extract_tool_input(response) -> dict | None:
     for block in response.content:
         if getattr(block, "type", None) == "tool_use":
-            return block.input
+            inp = block.input
+            if isinstance(inp, str):
+                try:
+                    parsed = json.loads(inp)
+                except Exception:
+                    logger.warning("tool_use.input was an unparsable string")
+                    return None
+                inp = parsed
+            return inp if isinstance(inp, dict) else None
     logger.warning("Claude did not return a tool_use block. Content: %s", response.content)
     return None
+
+
+def _coerce_dict_list(value) -> list[dict]:
+    """Defensively normalize a value that should be a list[dict] but might be a
+    JSON-encoded string (Claude occasionally returns nested JSON as text)."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return parsed
+    return []
 
 def _hash_request(payload: dict) -> str:
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -177,10 +200,12 @@ async def generate_problems(reviews: list[dict]) -> list[ProblemItem]:
             return []
         
         problems = []
-        for item in data.get("items", []):
+        for item in _coerce_dict_list(data.get("items")):
+            if not isinstance(item, dict):
+                continue
             try:
                 problems.append(ProblemItem(**item))
-            except ValidationError as e:
+            except (ValidationError, TypeError) as e:
                 logger.warning(f"Skipping malformed problem item: {item}. Error: {e}")
         return problems
 
@@ -251,17 +276,21 @@ async def generate_actions(reviews: list[dict]) -> tuple[list[PriorityItem], lis
             return [], []
         
         priorities = []
-        for p in data.get("priorities", []):
+        for p in _coerce_dict_list(data.get("priorities")):
+            if not isinstance(p, dict):
+                continue
             try:
                 priorities.append(PriorityItem(**p))
-            except ValidationError as e:
+            except (ValidationError, TypeError) as e:
                 logger.warning(f"Skipping malformed priority item: {p}. Error: {e}")
-                
+
         insights = []
-        for i in data.get("insights", []):
+        for i in _coerce_dict_list(data.get("insights")):
+            if not isinstance(i, dict):
+                continue
             try:
                 insights.append(InsightItem(**i))
-            except ValidationError as e:
+            except (ValidationError, TypeError) as e:
                 logger.warning(f"Skipping malformed insight item: {i}. Error: {e}")
         
         return priorities, insights
@@ -380,9 +409,8 @@ async def generate_top_mentions(
             return [], []
 
         top_problems = []
-        for item in data.get("top_problems", []):
+        for item in _coerce_dict_list(data.get("top_problems")):
             if not isinstance(item, dict):
-                logger.warning(f"Skipping non-dict top_problem: {item!r}")
                 continue
             try:
                 top_problems.append(TopMention(**item))
@@ -390,9 +418,8 @@ async def generate_top_mentions(
                 logger.warning(f"Skipping malformed top_problem: {item}. Error: {e}")
 
         top_praise = []
-        for item in data.get("top_praise", []):
+        for item in _coerce_dict_list(data.get("top_praise")):
             if not isinstance(item, dict):
-                logger.warning(f"Skipping non-dict top_praise: {item!r}")
                 continue
             try:
                 top_praise.append(TopMention(**item))
@@ -509,10 +536,12 @@ async def generate_recommendations(
             return []
 
         items: list[RecommendationItem] = []
-        for raw in data.get("items", []):
+        for raw in _coerce_dict_list(data.get("items")):
+            if not isinstance(raw, dict):
+                continue
             try:
                 items.append(RecommendationItem(**raw))
-            except ValidationError as e:
+            except (ValidationError, TypeError) as e:
                 logger.warning(f"Skipping malformed recommendation: {raw}. Error: {e}")
         return items
 
@@ -681,7 +710,7 @@ async def generate_topics_module(reviews: list[dict]) -> dict | None:
             return None
 
         topic_bars = []
-        for it in data.get("topic_bars", []):
+        for it in _coerce_dict_list(data.get("topic_bars")):
             if not isinstance(it, dict):
                 continue
             try:
@@ -690,7 +719,7 @@ async def generate_topics_module(reviews: list[dict]) -> dict | None:
                 logger.warning(f"Skipping malformed topic_bar: {it}. Error: {e}")
 
         top_positive = []
-        for it in data.get("top_positive", []):
+        for it in _coerce_dict_list(data.get("top_positive")):
             if not isinstance(it, dict):
                 continue
             try:
@@ -699,7 +728,7 @@ async def generate_topics_module(reviews: list[dict]) -> dict | None:
                 logger.warning(f"Skipping malformed top_positive: {it}. Error: {e}")
 
         top_negative = []
-        for it in data.get("top_negative", []):
+        for it in _coerce_dict_list(data.get("top_negative")):
             if not isinstance(it, dict):
                 continue
             try:
@@ -707,8 +736,14 @@ async def generate_topics_module(reviews: list[dict]) -> dict | None:
             except (ValidationError, TypeError) as e:
                 logger.warning(f"Skipping malformed top_negative: {it}. Error: {e}")
 
+        phrases_raw = data.get("frequent_phrases")
+        if isinstance(phrases_raw, str):
+            try:
+                phrases_raw = json.loads(phrases_raw)
+            except Exception:
+                phrases_raw = []
         frequent_phrases = [
-            p.strip() for p in data.get("frequent_phrases", []) if isinstance(p, str) and p.strip()
+            p.strip() for p in (phrases_raw or []) if isinstance(p, str) and p.strip()
         ]
 
         fgn_raw = data.get("fastest_growing_negative")
@@ -826,10 +861,12 @@ async def generate_reply_templates(
             return []
 
         items: list[ReplyTemplate] = []
-        for raw in data.get("items", []):
+        for raw in _coerce_dict_list(data.get("items")):
+            if not isinstance(raw, dict):
+                continue
             try:
                 items.append(ReplyTemplate(**raw))
-            except ValidationError as e:
+            except (ValidationError, TypeError) as e:
                 logger.warning(f"Skipping malformed reply template: {raw}. Error: {e}")
         return items
 
