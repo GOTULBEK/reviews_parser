@@ -201,3 +201,105 @@ class CompareResponse(BaseModel):
     competitors: list[CompareCompetitorItem]
     strengths: list[CompareStrengthItem]
 
+
+RecommendationIcon = Literal["shield", "headphones", "volume", "warning", "trend", "star"]
+RecommendationTone = Literal["red", "orange", "green"]
+
+
+class RecommendationItem(BaseModel):
+    icon: RecommendationIcon
+    tone: RecommendationTone
+    title: str
+    body: str
+
+
+class RecommendationsResponse(BaseModel):
+    task_id: UUID
+    status: str
+    items: list[RecommendationItem] = []
+    analytics_note: str | None = None
+
+
+TopicTone = Literal["pos", "neg", "neu"]
+
+
+class TopicBarItem(BaseModel):
+    label: str
+    positive: int
+    negative: int
+
+
+class TopicListItem(BaseModel):
+    label: str
+    sentiment: TopicTone
+    mentions: int
+
+
+class TopicTrend(BaseModel):
+    label: str
+    description: str
+
+
+class MonthlyAvgRatingPoint(BaseModel):
+    month: str
+    avg_rating: float | None = None
+
+
+class TopicsModuleResponse(BaseModel):
+    task_id: UUID
+    status: str
+    period_days: int | None = None
+    reviews_total: int
+    topics_count: int
+    topic_bars: list[TopicBarItem] = []
+    top_positive: list[TopicListItem] = []
+    top_negative: list[TopicListItem] = []
+    frequent_phrases: list[str] = []
+    fastest_growing_negative: TopicTrend | None = None
+    strongest_positive: TopicTrend | None = None
+    monthly_avg_rating: list[MonthlyAvgRatingPoint] = []
+    analytics_note: str | None = None
+
+
+ReplyPriority = Literal["urgent", "high", "medium", "low"]
+
+
+class RepliesKpis(BaseModel):
+    answered_count: int
+    answered_pct: int
+    avg_response_hours: float | None = None
+    negatives_replied_pct: int
+    overdue_sla_count: int
+
+
+class ReplyQueueItem(BaseModel):
+    id: UUID
+    branch_id: UUID
+    branch_name: str | None = None
+    user_name: str | None = None
+    rating: int | None = None
+    text: str | None = None
+    date_created: datetime | None = None
+    review_url: str
+    sentiment: Sentiment
+    priority: ReplyPriority
+    overdue_sla: bool
+    age_hours: float | None = None
+
+
+class ReplyTemplate(BaseModel):
+    title: str
+    text: str
+
+
+class RepliesModuleResponse(BaseModel):
+    task_id: UUID
+    status: str
+    sla_hours: int
+    unanswered_count: int
+    urgent_count: int
+    kpis: RepliesKpis
+    queue: list[ReplyQueueItem] = []
+    templates: list[ReplyTemplate] = []
+    analytics_note: str | None = None
+

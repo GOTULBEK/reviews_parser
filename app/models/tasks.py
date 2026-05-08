@@ -65,13 +65,31 @@ class TaskTopicsCache(Base):
         PGUUID(as_uuid=True), ForeignKey("search_tasks.id", ondelete="CASCADE"), nullable=False, index=True
     )
     days: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    
+
     top_problems: Mapped[list[dict] | None] = mapped_column(JSONB)
     top_praise: Mapped[list[dict] | None] = mapped_column(JSONB)
     problems: Mapped[list[dict] | None] = mapped_column(JSONB)
     priorities: Mapped[list[dict] | None] = mapped_column(JSONB)
     insights: Mapped[list[dict] | None] = mapped_column(JSONB)
-    
+    recommendations: Mapped[list[dict] | None] = mapped_column(JSONB)
+    topics_module: Mapped[dict | None] = mapped_column(JSONB)
+    reply_templates: Mapped[list[dict] | None] = mapped_column(JSONB)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class ClaudeApiCache(Base):
+    __tablename__ = "claude_api_cache"
+
+    request_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    response: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_hit_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

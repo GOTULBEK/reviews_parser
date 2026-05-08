@@ -1,5 +1,5 @@
 from .core import Company, Branch, Review
-from .tasks import TaskStatus, SearchTask, SearchTaskBranch, TaskTopicsCache
+from .tasks import TaskStatus, SearchTask, SearchTaskBranch, TaskTopicsCache, ClaudeApiCache
 
 __all__ = [
     "Company",
@@ -8,5 +8,6 @@ __all__ = [
     "TaskStatus",
     "SearchTask",
     "SearchTaskBranch",
-    "TaskTopicsCache"
+    "TaskTopicsCache",
+    "ClaudeApiCache",
 ]

@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+import sqlalchemy as sa
 from sqlalchemy import DateTime, and_, bindparam, case, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +69,59 @@ async def _fetch_reviews_as_dicts(
         stmt = stmt.where(Branch.source == source)
     rows = (await session.execute(stmt)).all()
     return [{"rating": r.rating, "text": r.text} for r in rows]
+
+
+async def _load_task_top_mentions(
+    task_id: UUID, session: AsyncSession
+) -> tuple[list[dict], list[dict]]:
+    """Look up cached top_problems/top_praise for the task across all (task_id, days)
+    rows. Returns the first populated pair found. Never calls Claude — the caller
+    decides whether to generate when missing."""
+    stmt = (
+        select(TaskTopicsCache.top_problems, TaskTopicsCache.top_praise, TaskTopicsCache.days)
+        .where(TaskTopicsCache.task_id == task_id)
+        .where(
+            or_(
+                TaskTopicsCache.top_problems.isnot(None),
+                TaskTopicsCache.top_praise.isnot(None),
+            )
+        )
+        .order_by(TaskTopicsCache.days.is_(None).desc(), TaskTopicsCache.days.asc())
+    )
+    rows = (await session.execute(stmt)).all()
+    top_problems: list[dict] = []
+    top_praise: list[dict] = []
+    for r in rows:
+        if not top_problems and r.top_problems:
+            top_problems = list(r.top_problems)
+        if not top_praise and r.top_praise:
+            top_praise = list(r.top_praise)
+        if top_problems and top_praise:
+            break
+    return top_problems, top_praise
+
+
+async def _fetch_reviews_with_dates(
+    task_id: UUID, session: AsyncSession, since: datetime | None = None, source: Literal["2gis", "zapis", "all"] = "2gis"
+) -> list[dict]:
+    stmt = (
+        select(Review.rating, Review.text, Review.date_created)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+        .where(SearchTaskBranch.task_id == task_id)
+        .where(Review.text.isnot(None))
+        .where(Review.text != "")
+    )
+    if since is not None:
+        stmt = stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
+    if source is not None and source != "all":
+        stmt = stmt.where(Branch.source == source)
+    stmt = stmt.order_by(Review.date_created.desc().nulls_last())
+    rows = (await session.execute(stmt)).all()
+    return [
+        {"rating": r.rating, "text": r.text, "date_created": r.date_created}
+        for r in rows
+    ]
 
 # Dashboard — /overview
 # ---------------------------------------------------------------------------
@@ -246,31 +300,47 @@ async def get_overview(
             )
             topics_cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
 
-            if topics_cache_row is not None:
-                top_problems = [TopMention(**t) for t in topics_cache_row.top_problems] if topics_cache_row.top_problems else []
-                top_praise = [TopMention(**t) for t in topics_cache_row.top_praise] if topics_cache_row.top_praise else []
+            top_problems: list[TopMention] = []
+            top_praise: list[TopMention] = []
+
+            if topics_cache_row is not None and (topics_cache_row.top_problems or topics_cache_row.top_praise):
+                top_problems = [TopMention(**t) for t in (topics_cache_row.top_problems or []) if isinstance(t, dict)]
+                top_praise = [TopMention(**t) for t in (topics_cache_row.top_praise or []) if isinstance(t, dict)]
             else:
-                reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
-                top_problems, top_praise = await claude_service.generate_top_mentions(reviews_dicts)
+                # Reuse top_mentions cached on any (task_id, *) row before paying for Claude again.
+                shared_problems, shared_praise = await _load_task_top_mentions(task_id, session)
+                if shared_problems or shared_praise:
+                    top_problems = [TopMention(**t) for t in shared_problems if isinstance(t, dict)]
+                    top_praise = [TopMention(**t) for t in shared_praise if isinstance(t, dict)]
 
                 if not top_problems and not top_praise:
-                    topic_docs = [ReviewDoc(id=str(i), text=r["text"], rating=r["rating"]) for i, r in enumerate(reviews_dicts)]
-                    loop = asyncio.get_running_loop()
-                    try:
-                        raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction_embeddings, topic_docs)
-                    except Exception:
-                        logging.exception("Embeddings topic extraction failed, falling back to TF-IDF topics")
-                        raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction, topic_docs)
-                    top_problems = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_problems]
-                    top_praise = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_praise]
+                    reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
+                    top_problems, top_praise = await claude_service.generate_top_mentions(reviews_dicts)
 
-                new_cache = TaskTopicsCache(
-                    task_id=task_id,
-                    days=int(days) if days is not None else None,
-                    top_problems=[t.model_dump() for t in top_problems],
-                    top_praise=[t.model_dump() for t in top_praise]
-                )
-                session.add(new_cache)
+                    if not top_problems and not top_praise:
+                        topic_docs = [ReviewDoc(id=str(i), text=r["text"], rating=r["rating"]) for i, r in enumerate(reviews_dicts)]
+                        loop = asyncio.get_running_loop()
+                        try:
+                            raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction_embeddings, topic_docs)
+                        except Exception:
+                            logging.exception("Embeddings topic extraction failed, falling back to TF-IDF topics")
+                            raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction, topic_docs)
+                        top_problems = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_problems]
+                        top_praise = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_praise]
+
+                if topics_cache_row is None:
+                    topics_cache_row = TaskTopicsCache(
+                        task_id=task_id,
+                        days=int(days) if days is not None else None,
+                        top_problems=[t.model_dump() for t in top_problems] or None,
+                        top_praise=[t.model_dump() for t in top_praise] or None,
+                    )
+                    session.add(topics_cache_row)
+                else:
+                    if not topics_cache_row.top_problems and top_problems:
+                        topics_cache_row.top_problems = [t.model_dump() for t in top_problems]
+                    if not topics_cache_row.top_praise and top_praise:
+                        topics_cache_row.top_praise = [t.model_dump() for t in top_praise]
                 try:
                     await session.commit()
                 except Exception:
@@ -1074,6 +1144,541 @@ async def get_task_actions(
 
 
 # ---------------------------------------------------------------------------
+# Dashboard — /recommendations
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{task_id}/recommendations",
+    response_model=RecommendationsResponse,
+    tags=["dashboard"],
+    summary="Системные рекомендации (Claude AI)",
+)
+async def get_task_recommendations(
+    task_id: UUID,
+    days: int | None = Query(
+        None,
+        ge=1,
+        alias="params",
+        description="If set, recommendations are generated from reviews of the last N days.",
+    ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    session: AsyncSession = Depends(get_session),
+):
+    task = await _require_task(task_id, session)
+    since: datetime | None = None
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=int(days))
+
+    cache_stmt = select(TaskTopicsCache).where(
+        TaskTopicsCache.task_id == task_id,
+        TaskTopicsCache.days == (int(days) if days is not None else None),
+    )
+    cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+
+    if cache_row is not None and cache_row.recommendations is not None:
+        items = [RecommendationItem(**r) for r in cache_row.recommendations]
+        return RecommendationsResponse(
+            task_id=task.id,
+            status=task.status.value,
+            items=items,
+            analytics_note=("Synthesized by Claude AI." if items else None),
+        )
+
+    # Aggregate KPIs (negative_pct / replies_pct / avg_rating / reviews_total) for the same window/source.
+    agg_stmt = (
+        select(
+            func.count().label("total"),
+            func.count().filter(Review.rating <= _SENT_NEG_MAX).label("neg"),
+            func.count().filter(Review.official_answer_text.isnot(None)).label("replied"),
+            func.avg(Review.rating).filter(Review.rating.isnot(None)).label("avg_rating"),
+        )
+        .select_from(Review)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+        .where(SearchTaskBranch.task_id == task_id)
+    )
+    if since is not None:
+        agg_stmt = agg_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
+    if source is not None and source != "all":
+        agg_stmt = agg_stmt.where(Branch.source == source)
+    agg_row = (await session.execute(agg_stmt)).one()
+
+    reviews_total = int(agg_row.total or 0)
+    kpis = {
+        "avg_rating": round(float(agg_row.avg_rating), 2) if agg_row.avg_rating is not None else None,
+        "negative_pct": _pct(int(agg_row.neg or 0), reviews_total),
+        "replies_pct": _pct(int(agg_row.replied or 0), reviews_total),
+        "reviews_total": reviews_total,
+    }
+
+    top_problems_raw: list[dict] = []
+    top_praise_raw: list[dict] = []
+    if cache_row is not None:
+        top_problems_raw = list(cache_row.top_problems or [])
+        top_praise_raw = list(cache_row.top_praise or [])
+
+    if not top_problems_raw and not top_praise_raw:
+        # Reuse top_mentions from any (task_id, *) cache row to avoid extra Claude calls.
+        top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session)
+
+    items = await claude_service.generate_recommendations(top_problems_raw, top_praise_raw, kpis)
+
+    payload = [i.model_dump() for i in items]
+    if cache_row is None:
+        new_cache = TaskTopicsCache(
+            task_id=task_id,
+            days=int(days) if days is not None else None,
+            top_problems=top_problems_raw or None,
+            top_praise=top_praise_raw or None,
+            recommendations=payload,
+        )
+        session.add(new_cache)
+    else:
+        cache_row.recommendations = payload
+        if not cache_row.top_problems and top_problems_raw:
+            cache_row.top_problems = top_problems_raw
+        if not cache_row.top_praise and top_praise_raw:
+            cache_row.top_praise = top_praise_raw
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        logging.exception("Failed to save recommendations cache")
+
+    return RecommendationsResponse(
+        task_id=task.id,
+        status=task.status.value,
+        items=items,
+        analytics_note=("Synthesized by Claude AI." if items else None),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — /topics (Pro module)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{task_id}/topics",
+    response_model=TopicsModuleResponse,
+    tags=["dashboard"],
+    summary="Темы отзывов: кластеризация, частые формулировки, тренды",
+)
+async def get_task_topics_module(
+    task_id: UUID,
+    days: int | None = Query(
+        None,
+        ge=1,
+        alias="params",
+        description="If set, topics are derived from reviews of the last N days.",
+    ),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    session: AsyncSession = Depends(get_session),
+):
+    task = await _require_task(task_id, session)
+    since: datetime | None = None
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=int(days))
+
+    cache_stmt = select(TaskTopicsCache).where(
+        TaskTopicsCache.task_id == task_id,
+        TaskTopicsCache.days == (int(days) if days is not None else None),
+    )
+    cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+
+    cached: dict | None = None
+    if cache_row is not None and cache_row.topics_module is not None:
+        cached = cache_row.topics_module
+
+    # reviews_total for the same window/source (deterministic, cheap)
+    count_stmt = (
+        select(func.count())
+        .select_from(Review)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+        .where(SearchTaskBranch.task_id == task_id)
+        .where(Review.text.isnot(None))
+        .where(Review.text != "")
+    )
+    if since is not None:
+        count_stmt = count_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
+    if source is not None and source != "all":
+        count_stmt = count_stmt.where(Branch.source == source)
+    reviews_total = int((await session.execute(count_stmt)).scalar_one() or 0)
+
+    # Monthly average rating (always computed, never via Claude). Last 12 months in TZ.
+    monthly_stmt = await session.execute(
+        text(
+            """
+WITH months AS (
+  SELECT generate_series(
+    date_trunc('month', timezone(:tz, now())) - interval '11 months',
+    date_trunc('month', timezone(:tz, now())),
+    interval '1 month'
+  ) AS month_start
+),
+agg AS (
+  SELECT
+    date_trunc('month', timezone(:tz, r.date_created)) AS month_start,
+    avg(r.rating) FILTER (WHERE r.rating IS NOT NULL) AS avg_rating
+  FROM reviews r
+  JOIN search_task_branches stb ON stb.branch_id = r.branch_id
+  JOIN branches b ON b.id = r.branch_id
+  WHERE stb.task_id = :task_id
+    AND r.date_created IS NOT NULL
+    AND (:source IS NULL OR b.source = :source)
+  GROUP BY 1
+)
+SELECT
+  to_char(m.month_start, 'YYYY-MM') AS month,
+  a.avg_rating
+FROM months m
+LEFT JOIN agg a USING (month_start)
+ORDER BY m.month_start ASC
+"""
+        ).bindparams(
+            bindparam("tz", type_=sa.String()),
+            bindparam("source", type_=sa.String()),
+        ),
+        {"task_id": task_id, "tz": _OVERVIEW_TZ, "source": source if source and source != "all" else None},
+    )
+    monthly_avg_rating = [
+        MonthlyAvgRatingPoint(
+            month=str(r.month),
+            avg_rating=round(float(r.avg_rating), 2) if r.avg_rating is not None else None,
+        )
+        for r in monthly_stmt.all()
+    ]
+
+    if cached is not None:
+        topic_bars = [TopicBarItem(**t) for t in (cached.get("topic_bars") or [])]
+        top_positive = [TopicListItem(**t) for t in (cached.get("top_positive") or [])]
+        top_negative = [TopicListItem(**t) for t in (cached.get("top_negative") or [])]
+        frequent_phrases = list(cached.get("frequent_phrases") or [])
+        fgn = TopicTrend(**cached["fastest_growing_negative"]) if cached.get("fastest_growing_negative") else None
+        sp = TopicTrend(**cached["strongest_positive"]) if cached.get("strongest_positive") else None
+    else:
+        reviews = await _fetch_reviews_with_dates(task_id, session, since=since, source=source)
+        result = await claude_service.generate_topics_module(reviews)
+        if result is None:
+            topic_bars, top_positive, top_negative = [], [], []
+            frequent_phrases = []
+            fgn = None
+            sp = None
+        else:
+            topic_bars = [TopicBarItem(**t) for t in result["topic_bars"]]
+            top_positive = [TopicListItem(**t) for t in result["top_positive"]]
+            top_negative = [TopicListItem(**t) for t in result["top_negative"]]
+            frequent_phrases = list(result["frequent_phrases"])
+            fgn = TopicTrend(**result["fastest_growing_negative"]) if result.get("fastest_growing_negative") else None
+            sp = TopicTrend(**result["strongest_positive"]) if result.get("strongest_positive") else None
+
+            payload = {
+                "topic_bars": [t.model_dump() for t in topic_bars],
+                "top_positive": [t.model_dump() for t in top_positive],
+                "top_negative": [t.model_dump() for t in top_negative],
+                "frequent_phrases": frequent_phrases,
+                "fastest_growing_negative": fgn.model_dump() if fgn else None,
+                "strongest_positive": sp.model_dump() if sp else None,
+            }
+
+            if cache_row is None:
+                cache_row = TaskTopicsCache(
+                    task_id=task_id,
+                    days=int(days) if days is not None else None,
+                    topics_module=payload,
+                )
+                session.add(cache_row)
+            else:
+                cache_row.topics_module = payload
+
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logging.exception("Failed to save topics_module cache")
+
+    topics_count = len(topic_bars)
+
+    return TopicsModuleResponse(
+        task_id=task.id,
+        status=task.status.value,
+        period_days=int(days) if days is not None else None,
+        reviews_total=reviews_total,
+        topics_count=topics_count,
+        topic_bars=topic_bars,
+        top_positive=top_positive,
+        top_negative=top_negative,
+        frequent_phrases=frequent_phrases,
+        fastest_growing_negative=fgn,
+        strongest_positive=sp,
+        monthly_avg_rating=monthly_avg_rating,
+        analytics_note=("Topics synthesized by Claude AI." if topic_bars else "Not enough data or AI unavailable."),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — /replies (Pro module)
+# ---------------------------------------------------------------------------
+
+def _reply_priority(rating: int | None, age_hours: float | None, sla_hours: int) -> str:
+    if rating is not None and rating <= _SENT_NEG_MAX:
+        if age_hours is not None and age_hours >= sla_hours:
+            return "urgent"
+        return "high"
+    if rating == 3:
+        return "medium"
+    return "low"
+
+
+@router.get(
+    "/{task_id}/replies",
+    response_model=RepliesModuleResponse,
+    tags=["dashboard"],
+    summary="Работа с ответами: KPI, очередь и шаблоны (Claude AI)",
+)
+async def get_task_replies_module(
+    task_id: UUID,
+    days: int | None = Query(
+        None,
+        ge=1,
+        alias="params",
+        description="If set, KPIs and queue are computed on reviews of the last N days.",
+    ),
+    sla_hours: int = Query(24, ge=1, le=24 * 30, description="SLA window in hours."),
+    queue_limit: int = Query(20, ge=1, le=100),
+    sort: Literal[
+        "negative_first", "newest_first", "oldest_first", "urgent_first"
+    ] = Query("negative_first", description="Queue ordering."),
+    source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    session: AsyncSession = Depends(get_session),
+):
+    task = await _require_task(task_id, session)
+    since: datetime | None = None
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=int(days))
+
+    base_filters = [SearchTaskBranch.task_id == task_id]
+    if since is not None:
+        base_filters.append(Review.date_created.isnot(None))
+        base_filters.append(Review.date_created >= since)
+    if source is not None and source != "all":
+        base_filters.append(Branch.source == source)
+
+    base_join = (
+        select(Review)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+    )
+
+    now = datetime.now(timezone.utc)
+
+    # Single aggregate query for KPIs.
+    response_seconds = func.extract(
+        "epoch", Review.official_answer_date - Review.date_created
+    )
+    overdue_clause = and_(
+        Review.official_answer_text.is_(None),
+        Review.date_created.isnot(None),
+        Review.date_created < (now - timedelta(hours=sla_hours)),
+    )
+    agg_stmt = (
+        select(
+            func.count().label("total"),
+            func.count().filter(Review.official_answer_text.isnot(None)).label("answered"),
+            func.count().filter(Review.rating <= _SENT_NEG_MAX).label("neg_total"),
+            func.count()
+            .filter(
+                and_(
+                    Review.rating <= _SENT_NEG_MAX,
+                    Review.official_answer_text.isnot(None),
+                )
+            )
+            .label("neg_answered"),
+            func.avg(response_seconds)
+            .filter(
+                and_(
+                    Review.official_answer_text.isnot(None),
+                    Review.official_answer_date.isnot(None),
+                    Review.date_created.isnot(None),
+                )
+            )
+            .label("avg_resp_seconds"),
+            func.count().filter(Review.official_answer_text.is_(None)).label("unanswered"),
+            func.count().filter(overdue_clause).label("overdue"),
+        )
+        .select_from(Review)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+        .where(and_(*base_filters))
+    )
+    agg = (await session.execute(agg_stmt)).one()
+
+    total = int(agg.total or 0)
+    answered = int(agg.answered or 0)
+    unanswered = int(agg.unanswered or 0)
+    overdue = int(agg.overdue or 0)
+    neg_total = int(agg.neg_total or 0)
+    neg_answered = int(agg.neg_answered or 0)
+    avg_resp_hours = (
+        round(float(agg.avg_resp_seconds) / 3600.0, 1)
+        if agg.avg_resp_seconds is not None
+        else None
+    )
+
+    def _pct_int(n: int, d: int) -> int:
+        if d <= 0:
+            return 0
+        return int(round(n * 100.0 / d))
+
+    kpis = RepliesKpis(
+        answered_count=answered,
+        answered_pct=_pct_int(answered, total),
+        avg_response_hours=avg_resp_hours,
+        negatives_replied_pct=_pct_int(neg_answered, neg_total),
+        overdue_sla_count=overdue,
+    )
+
+    # Urgent count (negatives older than SLA, unanswered).
+    urgent_stmt = (
+        select(func.count())
+        .select_from(Review)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+        .where(and_(*base_filters))
+        .where(Review.official_answer_text.is_(None))
+        .where(Review.rating <= _SENT_NEG_MAX)
+        .where(Review.date_created.isnot(None))
+        .where(Review.date_created < (now - timedelta(hours=sla_hours)))
+    )
+    urgent_count = int((await session.execute(urgent_stmt)).scalar_one() or 0)
+
+    # Queue ordering depends on the `sort` param.
+    rating_priority = case(
+        (Review.rating <= _SENT_NEG_MAX, 0),
+        (Review.rating == 3, 1),
+        else_=2,
+    )
+    overdue_priority = case(
+        (
+            and_(
+                Review.date_created.isnot(None),
+                Review.date_created < (now - timedelta(hours=sla_hours)),
+            ),
+            0,
+        ),
+        else_=1,
+    )
+
+    if sort == "newest_first":
+        order_cols = (Review.date_created.desc().nulls_last(),)
+    elif sort == "oldest_first":
+        order_cols = (Review.date_created.asc().nulls_last(),)
+    elif sort == "urgent_first":
+        order_cols = (
+            overdue_priority.asc(),
+            rating_priority.asc(),
+            Review.date_created.desc().nulls_last(),
+        )
+    else:  # negative_first (default)
+        order_cols = (rating_priority.asc(), Review.date_created.desc().nulls_last())
+
+    queue_stmt = (
+        select(Review, Branch.name.label("branch_name"))
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
+        .join(Branch, Branch.id == Review.branch_id)
+        .where(and_(*base_filters))
+        .where(Review.official_answer_text.is_(None))
+        .where(Review.text.isnot(None))
+        .where(Review.text != "")
+        .order_by(*order_cols)
+        .limit(queue_limit)
+    )
+    queue_rows = (await session.execute(queue_stmt)).all()
+
+    queue: list[ReplyQueueItem] = []
+    for r, branch_name in queue_rows:
+        age_hours: float | None = None
+        if r.date_created is not None:
+            delta = now - r.date_created
+            age_hours = round(delta.total_seconds() / 3600.0, 1)
+        overdue_sla = (
+            r.date_created is not None
+            and r.date_created < (now - timedelta(hours=sla_hours))
+        )
+        priority = _reply_priority(r.rating, age_hours, sla_hours)
+        queue.append(
+            ReplyQueueItem(
+                id=r.id,
+                branch_id=r.branch_id,
+                branch_name=branch_name,
+                user_name=r.user_name,
+                rating=r.rating,
+                text=r.text,
+                date_created=r.date_created,
+                review_url=r.review_url,
+                sentiment=_sentiment_from_rating(r.rating),
+                priority=priority,
+                overdue_sla=overdue_sla,
+                age_hours=age_hours,
+            )
+        )
+
+    # Templates — Claude-generated and cached per (task_id, days).
+    cache_stmt = select(TaskTopicsCache).where(
+        TaskTopicsCache.task_id == task_id,
+        TaskTopicsCache.days == (int(days) if days is not None else None),
+    )
+    cache_row = (await session.execute(cache_stmt)).scalar_one_or_none()
+
+    templates: list[ReplyTemplate] = []
+    if cache_row is not None and cache_row.reply_templates:
+        templates = [ReplyTemplate(**t) for t in cache_row.reply_templates if isinstance(t, dict)]
+    else:
+        top_problems_raw: list[dict] = list(cache_row.top_problems or []) if cache_row else []
+        top_praise_raw: list[dict] = list(cache_row.top_praise or []) if cache_row else []
+        if not top_problems_raw and not top_praise_raw:
+            top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session)
+
+        templates = await claude_service.generate_reply_templates(top_problems_raw, top_praise_raw)
+        payload = [t.model_dump() for t in templates]
+
+        if cache_row is None:
+            cache_row = TaskTopicsCache(
+                task_id=task_id,
+                days=int(days) if days is not None else None,
+                top_problems=top_problems_raw or None,
+                top_praise=top_praise_raw or None,
+                reply_templates=payload,
+            )
+            session.add(cache_row)
+        else:
+            cache_row.reply_templates = payload
+            if not cache_row.top_problems and top_problems_raw:
+                cache_row.top_problems = top_problems_raw
+            if not cache_row.top_praise and top_praise_raw:
+                cache_row.top_praise = top_praise_raw
+
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logging.exception("Failed to save reply_templates cache")
+
+    return RepliesModuleResponse(
+        task_id=task.id,
+        status=task.status.value,
+        sla_hours=sla_hours,
+        unanswered_count=unanswered,
+        urgent_count=urgent_count,
+        kpis=kpis,
+        queue=queue,
+        templates=templates,
+        analytics_note=("Templates synthesized by Claude AI." if templates else None),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dashboard — /compare
 # ---------------------------------------------------------------------------
 
@@ -1126,14 +1731,12 @@ async def get_compare(
                 func.count(Review.id).filter(Review.rating <= 2).label("neg_n"),
                 func.count(Review.id).filter(Review.official_answer_text.isnot(None)).label("replied_n"),
                 func.avg(Review.rating).filter(Review.rating.isnot(None)).label("avg_rating"),
-                func.array_agg(Branch.categories).label("categories_agg")
             )
             .select_from(Company)
             .join(Branch, Branch.company_id == Company.id)
             .outerjoin(Review, Review.branch_id == Branch.id)
         )
         if target_categories:
-            from sqlalchemy.dialects.postgresql import ARRAY as PGARRAY
             stmt = stmt.where(
                 or_(
                     Branch.categories.overlap(target_categories),
@@ -1173,6 +1776,27 @@ async def get_compare(
 
     rows = (await session.execute(stmt)).all()
 
+    cats_by_company: dict = {}
+    if grouped:
+        cat_stmt = (
+            select(Branch.company_id, Branch.categories)
+            .where(Branch.categories.isnot(None))
+        )
+        if target_categories:
+            cat_stmt = cat_stmt.where(
+                or_(
+                    Branch.categories.overlap(target_categories),
+                    Branch.category.in_(target_categories),
+                    Branch.id.in_(target_branch_ids),
+                )
+            )
+        if target_city:
+            cat_stmt = cat_stmt.where(Branch.city == target_city)
+        for cid, cats in (await session.execute(cat_stmt)).all():
+            if not cats:
+                continue
+            cats_by_company.setdefault(cid, set()).update(cats)
+
     competitors_data = []
     total_rating = 0.0
     total_rated_companies = 0
@@ -1201,13 +1825,7 @@ async def get_compare(
             name = row.company_name
             address = None
             branch_id = None
-            # Flatten array of arrays
-            cats_raw = row.categories_agg or []
-            cats_set = set()
-            for sublist in cats_raw:
-                if sublist:
-                    cats_set.update(sublist)
-            categories = sorted(list(cats_set))
+            categories = sorted(cats_by_company.get(comp_id, set()))
         else:
             b = row.Branch
             branch_id = b.id

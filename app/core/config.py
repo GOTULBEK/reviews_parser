@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     
     # --- New Settings for Claude ---
     anthropic_api_key: str | None = None
-    claude_model: str = "claude-3-haiku-20240307" # Haiku is fast/cheap for parsing, Sonnet 3.5 is better for deep insights
+    claude_model: str = "claude-haiku-4-5-20251001"
     max_reviews_to_analyze: int = 1000 # Guardrail for token limits
 
     max_concurrent_branches: int = 5
