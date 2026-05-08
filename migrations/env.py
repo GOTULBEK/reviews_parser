@@ -27,7 +27,10 @@ import app.models  # load models
 
 target_metadata = Base.metadata
 
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Alembic's Config uses Python's configparser interpolation, where '%' is special.
+# Database URLs may include percent-encoded credentials (e.g. %23), so we must
+# escape '%' as '%%' when injecting into the config.
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
