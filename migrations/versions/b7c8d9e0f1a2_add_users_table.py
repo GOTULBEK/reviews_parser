@@ -18,7 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute("CREATE TYPE user_role AS ENUM ('admin', 'customer')")
+    op.execute("CREATE TYPE IF NOT EXISTS user_role AS ENUM ('admin', 'customer')")
     op.create_table(
         "users",
         sa.Column("id", PGUUID(as_uuid=True), primary_key=True),
