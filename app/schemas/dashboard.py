@@ -240,6 +240,17 @@ class TopicTrend(BaseModel):
     description: str
 
 
+class TopicTimeSeriesPoint(BaseModel):
+    month: str
+    positive: int
+    negative: int
+
+
+class TopicTimeSeries(BaseModel):
+    label: str
+    monthly: list[TopicTimeSeriesPoint] = []
+
+
 class MonthlyAvgRatingPoint(BaseModel):
     month: str
     avg_rating: float | None = None
@@ -258,6 +269,7 @@ class TopicsModuleResponse(BaseModel):
     fastest_growing_negative: TopicTrend | None = None
     strongest_positive: TopicTrend | None = None
     monthly_avg_rating: list[MonthlyAvgRatingPoint] = []
+    topic_timeseries: list[TopicTimeSeries] = []
     analytics_note: str | None = None
 
 

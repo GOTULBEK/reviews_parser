@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_session
+from app.models.auth import User, UserRole
 from app.models.tasks import SearchTask, TaskStatus, SearchTaskBranch
 from app.models.core import Branch
 from app.schemas.tasks import (
@@ -42,6 +43,14 @@ async def get_task_status(task_id: UUID, session: AsyncSession = Depends(get_ses
     )
     reviews_total = (await session.execute(reviews_total_stmt)).scalar_one()
 
+    customer_stmt = (
+        select(func.count())
+        .select_from(User)
+        .where(User.task_id == task_id)
+        .where(User.role == UserRole.customer)
+    )
+    have_customer = 1 if (await session.execute(customer_stmt)).scalar_one() > 0 else 0
+
     return TaskStatusResponse(
         task_id=task.id,
         status=task.status.value,
@@ -56,6 +65,7 @@ async def get_task_status(task_id: UUID, session: AsyncSession = Depends(get_ses
         created_at=task.created_at,
         started_at=task.started_at,
         completed_at=task.completed_at,
+        have_customer=have_customer,
     )
 
 @router.get(

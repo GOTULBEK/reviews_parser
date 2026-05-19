@@ -26,4 +26,8 @@ class Settings(BaseSettings):
     # Dataset logging (CSV, UTF-8). Relative paths are resolved from CWD.
     dataset_dir: str = "datasets"
 
+    # Auth / JWT
+    secret_key: str = "change-me-in-production-use-a-long-random-string"
+    access_token_expire_hours: int = 24
+
 settings = Settings()

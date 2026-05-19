@@ -23,6 +23,7 @@ class TaskStatusResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    have_customer: int = 0
 
 class ReviewResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)

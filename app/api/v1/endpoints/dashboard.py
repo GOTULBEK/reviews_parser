@@ -19,6 +19,7 @@ from app.services import claude as claude_service
 from app.services.topics import ReviewDoc
 
 from app.api.v1.endpoints.tasks import _require_task
+from app.schemas.dashboard import TopicTimeSeries, TopicTimeSeriesPoint
 
 router = APIRouter()
 
@@ -46,6 +47,78 @@ _overview_inflight = {}
 _overview_lock = asyncio.Lock()
 
 from app.services.topics import extract_topics, extract_topics_embeddings
+
+_TOPIC_STOP = {"и", "в", "на", "с", "за", "по", "к", "о", "из", "от", "для", "при", "что"}
+
+
+def _topic_keywords(label: str) -> list[str]:
+    words = [w.strip(".,!?-") for w in label.lower().split()]
+    kws = [w for w in words if len(w) > 3 and w not in _TOPIC_STOP]
+    return kws if kws else ([words[0]] if words else [label.lower()])
+
+
+async def _compute_topic_timeseries(
+    task_id: UUID,
+    topic_bars: list,
+    session: AsyncSession,
+    source: str,
+) -> list[dict]:
+    """Single DB fetch → keyword matching per topic → monthly pos/neg counts."""
+    rows = (
+        await session.execute(
+            text("""
+                SELECT
+                    to_char(date_trunc('month', timezone(:tz, r.date_created)), 'YYYY-MM') AS month,
+                    lower(r.text) AS text,
+                    r.rating
+                FROM reviews r
+                JOIN search_task_branches stb ON stb.branch_id = r.branch_id
+                JOIN branches b ON b.id = r.branch_id
+                WHERE stb.task_id = :task_id
+                  AND r.date_created IS NOT NULL
+                  AND r.text IS NOT NULL
+                  AND r.text != ''
+                  AND (:source IS NULL OR b.source = :source)
+                  AND r.date_created >= (now() - interval '12 months')
+            """).bindparams(
+                bindparam("tz", type_=sa.String()),
+                bindparam("source", type_=sa.String()),
+            ),
+            {
+                "task_id": task_id,
+                "tz": _OVERVIEW_TZ,
+                "source": source if source and source != "all" else None,
+            },
+        )
+    ).all()
+
+    result = []
+    for bar in topic_bars:
+        kws = _topic_keywords(bar.label if hasattr(bar, "label") else bar["label"])
+        monthly: dict[str, dict[str, int]] = {}
+        for row in rows:
+            if not any(kw in (row.text or "") for kw in kws):
+                continue
+            m = row.month
+            if m not in monthly:
+                monthly[m] = {"positive": 0, "negative": 0}
+            if row.rating is not None:
+                if row.rating >= 4:
+                    monthly[m]["positive"] += 1
+                elif row.rating <= 2:
+                    monthly[m]["negative"] += 1
+        result.append(
+            {
+                "label": bar.label if hasattr(bar, "label") else bar["label"],
+                "monthly": [
+                    {"month": m, "positive": v["positive"], "negative": v["negative"]}
+                    for m, v in sorted(monthly.items())
+                ],
+            }
+        )
+    return result
+
+
 def _run_topic_extraction(docs):
     return extract_topics(docs, top_n=8, min_mentions=3)
 
@@ -311,6 +384,19 @@ async def get_overview(
             if topics_cache_row is not None and (topics_cache_row.top_problems or topics_cache_row.top_praise):
                 top_problems = [TopMention(**t) for t in (topics_cache_row.top_problems or []) if isinstance(t, dict)]
                 top_praise = [TopMention(**t) for t in (topics_cache_row.top_praise or []) if isinstance(t, dict)]
+            elif topics_cache_row is not None and topics_cache_row.topics_module:
+                # /topics was already called — derive top-5 from the shared cache, no extra Claude call.
+                _module = topics_cache_row.topics_module
+                top_problems = [
+                    TopMention(label=t["label"], mentions=t.get("mentions", 0), examples=[])
+                    for t in (_module.get("top_negative") or [])[:5]
+                    if isinstance(t, dict)
+                ]
+                top_praise = [
+                    TopMention(label=t["label"], mentions=t.get("mentions", 0), examples=[])
+                    for t in (_module.get("top_positive") or [])[:5]
+                    if isinstance(t, dict)
+                ]
             else:
                 # Reuse top_mentions cached on any (task_id, *) row before paying for Claude again.
                 shared_problems, shared_praise = await _load_task_top_mentions(task_id, session)
@@ -1238,8 +1324,39 @@ async def get_task_recommendations(
         top_praise_raw = list(cache_row.top_praise or [])
 
     if not top_problems_raw and not top_praise_raw:
-        # Reuse top_mentions from any (task_id, *) cache row to avoid extra Claude calls.
+        # Try shared top_mentions cache first.
         top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session)
+
+    if not top_problems_raw and not top_praise_raw:
+        # Try deriving from topics_module cache (populated by /topics endpoint).
+        any_cache = (
+            await session.execute(
+                select(TaskTopicsCache)
+                .where(TaskTopicsCache.task_id == task_id)
+                .where(TaskTopicsCache.topics_module.isnot(None))
+                .order_by(TaskTopicsCache.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if any_cache and any_cache.topics_module:
+            _mod = any_cache.topics_module
+            top_problems_raw = [
+                {"label": t["label"], "mentions": t.get("mentions", 0), "examples": []}
+                for t in (_mod.get("top_negative") or [])[:6]
+                if isinstance(t, dict)
+            ]
+            top_praise_raw = [
+                {"label": t["label"], "mentions": t.get("mentions", 0), "examples": []}
+                for t in (_mod.get("top_positive") or [])[:6]
+                if isinstance(t, dict)
+            ]
+
+    if not top_problems_raw and not top_praise_raw:
+        # Last resort: generate top mentions fresh from reviews.
+        reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
+        _problems_list, _praise_list = await claude_service.generate_top_mentions(reviews_dicts)
+        top_problems_raw = [t.model_dump() for t in _problems_list]
+        top_praise_raw = [t.model_dump() for t in _praise_list]
 
     items = await claude_service.generate_recommendations(top_problems_raw, top_praise_raw, kpis)
 
@@ -1382,6 +1499,16 @@ ORDER BY m.month_start ASC
         frequent_phrases = list(cached.get("frequent_phrases") or [])
         fgn = TopicTrend(**cached["fastest_growing_negative"]) if cached.get("fastest_growing_negative") else None
         sp = TopicTrend(**cached["strongest_positive"]) if cached.get("strongest_positive") else None
+        # Timeseries may be missing from older cache rows — compute and persist it on-demand.
+        _ts_raw = cached.get("topic_timeseries")
+        if _ts_raw is None and topic_bars:
+            _ts_raw = await _compute_topic_timeseries(task_id, topic_bars, session, source)
+            try:
+                cache_row.topics_module = {**cached, "topic_timeseries": _ts_raw}
+                await session.commit()
+            except Exception:
+                await session.rollback()
+        topic_timeseries = [TopicTimeSeries(**t) for t in (_ts_raw or [])]
     else:
         reviews = await _fetch_reviews_with_dates(task_id, session, since=since, source=source)
         result = await claude_service.generate_topics_module(reviews)
@@ -1390,6 +1517,7 @@ ORDER BY m.month_start ASC
             frequent_phrases = []
             fgn = None
             sp = None
+            topic_timeseries = []
         else:
             topic_bars = [TopicBarItem(**t) for t in result["topic_bars"]]
             top_positive = [TopicListItem(**t) for t in result["top_positive"]]
@@ -1398,6 +1526,9 @@ ORDER BY m.month_start ASC
             fgn = TopicTrend(**result["fastest_growing_negative"]) if result.get("fastest_growing_negative") else None
             sp = TopicTrend(**result["strongest_positive"]) if result.get("strongest_positive") else None
 
+            _ts_raw = await _compute_topic_timeseries(task_id, topic_bars, session, source)
+            topic_timeseries = [TopicTimeSeries(**t) for t in _ts_raw]
+
             payload = {
                 "topic_bars": [t.model_dump() for t in topic_bars],
                 "top_positive": [t.model_dump() for t in top_positive],
@@ -1405,6 +1536,7 @@ ORDER BY m.month_start ASC
                 "frequent_phrases": frequent_phrases,
                 "fastest_growing_negative": fgn.model_dump() if fgn else None,
                 "strongest_positive": sp.model_dump() if sp else None,
+                "topic_timeseries": _ts_raw,
             }
 
             if cache_row is None:
@@ -1438,6 +1570,7 @@ ORDER BY m.month_start ASC
         fastest_growing_negative=fgn,
         strongest_positive=sp,
         monthly_avg_rating=monthly_avg_rating,
+        topic_timeseries=topic_timeseries,
         analytics_note=("Topics synthesized by Claude AI." if topic_bars else "Not enough data or AI unavailable."),
     )
 

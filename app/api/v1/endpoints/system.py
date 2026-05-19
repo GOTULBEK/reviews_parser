@@ -1,21 +1,28 @@
 from uuid import UUID
-from fastapi import Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from app.db.database import get_session
-from app.models.core import Review, Branch
-from app.schemas.tasks import ReviewResponse, BranchResponse
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.dependencies import require_admin
+from app.db.database import get_session
+from app.models.core import Branch, Review
+from app.schemas.tasks import BranchResponse, ReviewResponse
+
 router = APIRouter()
+
 
 @router.get("/health", tags=["meta"])
 async def health():
     return {"status": "ok"}
-# Single-resource retrieval
-# ---------------------------------------------------------------------------
 
-@router.get("/reviews/{review_uuid}", response_model=ReviewResponse, tags=["reviews"])
+
+@router.get(
+    "/reviews/{review_uuid}",
+    response_model=ReviewResponse,
+    tags=["reviews"],
+    dependencies=[Depends(require_admin)],
+)
 async def get_review(review_uuid: UUID, session: AsyncSession = Depends(get_session)):
     review = await session.get(Review, review_uuid)
     if not review:
@@ -23,7 +30,12 @@ async def get_review(review_uuid: UUID, session: AsyncSession = Depends(get_sess
     return ReviewResponse.model_validate(review)
 
 
-@router.get("/branches/{branch_uuid}", response_model=BranchResponse, tags=["branches"])
+@router.get(
+    "/branches/{branch_uuid}",
+    response_model=BranchResponse,
+    tags=["branches"],
+    dependencies=[Depends(require_admin)],
+)
 async def get_branch(branch_uuid: UUID, session: AsyncSession = Depends(get_session)):
     branch = await session.get(Branch, branch_uuid)
     if not branch:
@@ -35,6 +47,7 @@ async def get_branch(branch_uuid: UUID, session: AsyncSession = Depends(get_sess
     "/branches/{branch_uuid}/reviews",
     response_model=list[ReviewResponse],
     tags=["branches"],
+    dependencies=[Depends(require_admin)],
 )
 async def list_branch_reviews(
     branch_uuid: UUID,
@@ -49,6 +62,5 @@ async def list_branch_reviews(
         .limit(limit)
         .offset(offset)
     )
-    result = await session.execute(stmt)
-    reviews = result.scalars().all()
+    reviews = (await session.execute(stmt)).scalars().all()
     return [ReviewResponse.model_validate(r) for r in reviews]
