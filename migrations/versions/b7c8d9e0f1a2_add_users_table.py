@@ -18,12 +18,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute("""
-        DO $$ BEGIN
-            CREATE TYPE user_role AS ENUM ('admin', 'customer');
-        EXCEPTION WHEN duplicate_object THEN NULL;
-        END $$;
-    """)
     op.create_table(
         "users",
         sa.Column("id", PGUUID(as_uuid=True), primary_key=True),
