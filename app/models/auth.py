@@ -20,7 +20,7 @@ class User(Base):
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     login: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
-    role: Mapped[UserRole] = mapped_column(SAEnum(UserRole, name="user_role"), nullable=False)
+    role: Mapped[UserRole] = mapped_column(SAEnum(UserRole, name="user_role", create_type=False), nullable=False)
     task_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True),
         ForeignKey("search_tasks.id", ondelete="SET NULL"),
