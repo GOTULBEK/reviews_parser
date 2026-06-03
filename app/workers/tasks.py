@@ -203,8 +203,14 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
         task = await session.get(SearchTask, task_id)
         task_city = task.city if task is not None else ""
         task_query = task.query if task is not None else ""
-        
-        data["city"] = task_city
+
+        # Город филиала: для одногородней задачи — город задачи; для city='all'
+        # берём реальный город, извлечённый со страницы фирмы при скрапе
+        # (scraper кладёт его в data['city']). Так фильтр по городу работает корректно.
+        if task_city and task_city != "all":
+            data["city"] = task_city
+        else:
+            data["city"] = data.get("city")
         # Always inject the search query into the categories array so that
         # branches discovered under different rubric names (e.g. "Тренажёрные залы"
         # vs "Фитнес-клуб") still match each other when the task query is the same.
@@ -229,7 +235,7 @@ async def _persist_branch_result(task_id: UUID, data: dict) -> int:
         if settings.app_env.lower() == "local":
             try:
                 await append_place_row(
-                    build_place_row(task_id=str(task_id), city=task_city, branch_data=data)
+                    build_place_row(task_id=str(task_id), city=(data.get("city") or task_city), branch_data=data)
                 )
                 for r in data.get("reviews", []) or []:
                     r["source"] = data.get("source", "2gis")

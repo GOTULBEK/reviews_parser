@@ -6,6 +6,10 @@ class Settings(BaseSettings):
     app_env: str = ""
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/twogis"
     twogis_reviews_api_key: str = "6e7e1929-4ea9-4a5d-8c05-d601860389bd"
+    # Публичный web-ключ 2ГИС для Catalog API (список городов/регионов).
+    twogis_web_api_key: str = "c7f1a769-c8a5-4636-b14d-d8c987808a12"
+    twogis_catalog_base: str = "https://catalog.api.2gis.com"
+    cities_cache_ttl_seconds: int = 86400  # каталог городов меняется крайне редко
     
     # --- New Settings for Claude ---
     anthropic_api_key: str | None = None
@@ -13,7 +17,13 @@ class Settings(BaseSettings):
     max_reviews_to_analyze: int = 1000 # Guardrail for token limits
 
     max_concurrent_branches: int = 5
+    # Сколько городов опрашивать параллельно при city="all". Держим низким:
+    # 2ГИС троттлит (ConnectTimeout), если ударить всеми 19 городами разом.
+    max_concurrent_cities: int = 4
     max_branches_per_search: int = 50
+    # Бэкстоп от зацикливания пагинации при max_results=0 (без лимита).
+    # ~12 фирм/страница → 200 страниц ≈ 2400 фирм на город. 2ГИС обычно отдаёт меньше.
+    search_max_pages_hard_cap: int = 200
     request_timeout_seconds: int = 15
     rate_limit_sleep_min: float = 1.0
     rate_limit_sleep_max: float = 2.0

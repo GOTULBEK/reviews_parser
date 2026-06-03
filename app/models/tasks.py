@@ -58,13 +58,21 @@ class SearchTaskBranch(Base):
 
 class TaskTopicsCache(Base):
     __tablename__ = "task_topics_cache"
-    __table_args__ = (UniqueConstraint("task_id", "days", name="uq_task_days_topics"),)
+    # Кэш AI-аналитики ключуется по (task_id, days, source, city). source/city
+    # nullable для совместимости со старыми строками; в lookup'ах используется
+    # COALESCE(source,'2gis')/COALESCE(city,'all'), поэтому старые NULL-строки
+    # продолжают обслуживать дефолтные запросы (source=2gis, city=all).
+    __table_args__ = (
+        UniqueConstraint("task_id", "days", "source", "city", name="uq_task_days_source_city_topics"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("search_tasks.id", ondelete="CASCADE"), nullable=False, index=True
     )
     days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     top_problems: Mapped[list[dict] | None] = mapped_column(JSONB)
     top_praise: Mapped[list[dict] | None] = mapped_column(JSONB)

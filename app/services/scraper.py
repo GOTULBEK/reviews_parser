@@ -13,6 +13,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.core.config import settings
+from app.services.cities import KZ_CITY_SLUGS
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,34 @@ _HEADERS_HTML = {
 # Step 1 — text search → list of branch IDs
 # ---------------------------------------------------------------------------
 
+async def _get_with_retry(
+    client: httpx.AsyncClient, url: str, headers: dict, attempts: int = 3
+) -> httpx.Response | None:
+    """GET с ретраями на сетевые сбои и 5xx.
+
+    Без ретраев одна транзиентная ошибка (reset/timeout) на 1-й странице поиска
+    обнуляла всю выдачу. Возвращает Response (любой статус) или None, если все
+    попытки упали на сетевом уровне.
+    """
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            res = await client.get(url, headers=headers)
+        except httpx.RequestError as e:
+            last_exc = e
+            logger.warning("Search GET failed (attempt %d/%d): %r", i + 1, attempts, e)
+        else:
+            # 5xx — транзиентная серверная ошибка, имеет смысл повторить.
+            if res.status_code >= 500 and i < attempts - 1:
+                logger.warning("Search GET HTTP %d (attempt %d/%d), retrying", res.status_code, i + 1, attempts)
+            else:
+                return res
+        if i < attempts - 1:
+            await asyncio.sleep(0.5 * (i + 1))
+    if last_exc is not None:
+        logger.error("Search GET gave up after %d attempts: %r", attempts, last_exc)
+    return None
+
 async def search_branches(
     client: httpx.AsyncClient, query: str, city: str, max_branches: int
 ) -> list[dict]:
@@ -51,13 +80,24 @@ async def search_branches(
     seen: set[int] = set()
     ordered: list[int] = []
 
+    # max_branches <= 0 → "без лимита": собираем всё, что 2ГИС отдаёт по запросу,
+    # пока не закончится пагинация (404/410). page-бэкстоп страхует от зацикливания.
+    unlimited = max_branches <= 0
+    page_cap = settings.search_max_pages_hard_cap
+
     # 2GIS search pages:
     # - page 1: /{city}/search/{query}
     # - page N: /{city}/search/{query}/page/{N}/
     safe_query = quote(query, safe="")
     page = 1
     while True:
-        if len(ordered) >= max_branches:
+        if not unlimited and len(ordered) >= max_branches:
+            break
+        if page > page_cap:
+            logger.warning(
+                "Search hit page hard-cap (%d) for city=%s query=%r — stopping with %d results",
+                page_cap, city, query, len(ordered),
+            )
             break
 
         search_url = (
@@ -68,10 +108,10 @@ async def search_branches(
 
         logger.info("Search request: %s", search_url)
 
-        try:
-            res = await client.get(search_url, headers=_HEADERS_HTML)
-        except httpx.RequestError as e:
-            logger.error("Search HTTP error: %s", e)
+        res = await _get_with_retry(client, search_url, _HEADERS_HTML)
+        if res is None:
+            # Все попытки упали на сетевом уровне. Если это была не первая страница,
+            # отдаём, что уже собрали; на первой — пусто (и наверху будет 503).
             break
 
         if "/museum" in str(res.url):
@@ -92,7 +132,7 @@ async def search_branches(
             if fid not in seen:
                 seen.add(fid)
                 ordered.append(fid)
-                if len(ordered) >= max_branches:
+                if not unlimited and len(ordered) >= max_branches:
                     break
 
         # Stop when page is empty (no new firm IDs).
@@ -101,7 +141,8 @@ async def search_branches(
 
         page += 1
 
-    ordered = ordered[:max_branches]
+    if not unlimited:
+        ordered = ordered[:max_branches]
     return [
         {
             "gis_branch_id": fid,
@@ -125,10 +166,9 @@ def _normalize_firm_url(firm_url: str) -> str:
 async def _fetch_firm_soup(client: httpx.AsyncClient, firm_url: str) -> BeautifulSoup | None:
     """Загружает firm-страницу и парсит в BeautifulSoup. None при любой ошибке."""
     page_url = _normalize_firm_url(firm_url)
-    try:
-        res = await client.get(page_url, headers=_HEADERS_HTML)
-    except httpx.RequestError as e:
-        logger.warning("Firm page fetch error (%s): %s", page_url, e)
+    res = await _get_with_retry(client, page_url, _HEADERS_HTML, attempts=2)
+    if res is None:
+        logger.warning("Firm page fetch failed after retries: %s", page_url)
         return None
 
     if res.status_code != 200:
@@ -263,13 +303,27 @@ def _strip_2gis_suffix(value: str) -> str:
     return value
 
 
-async def scrape_branch_info(client: httpx.AsyncClient, firm_url: str) -> tuple[str | None, str | None, str, list[str]]:
-    """Обертка для одной сетевой загрузки + извлечение имени, категорий и адреса."""
+def _extract_city_from_soup(soup: BeautifulSoup) -> str | None:
+    """Достаёт slug города из ссылок страницы фирмы (`/{city}/firm|geo/{id}`).
+
+    Работает, т.к. 2ГИС редиректит firm-URL с любым городом на правильный, и все
+    ссылки на странице уже содержат настоящий город. Нужно для city='all', где
+    город каждого филиала заранее неизвестен.
+    """
+    for a in soup.find_all("a", href=re.compile(r"^/[a-z-]+/(?:firm|geo)/\d+")):
+        m = re.match(r"^/([a-z-]+)/(?:firm|geo)/\d+", a.get("href", ""))
+        if m and m.group(1) in KZ_CITY_SLUGS:
+            return m.group(1)
+    return None
+
+
+async def scrape_branch_info(client: httpx.AsyncClient, firm_url: str) -> tuple[str | None, str | None, str, list[str], str | None]:
+    """Обертка для одной сетевой загрузки + извлечение имени, категорий, адреса, города."""
     soup = await _fetch_firm_soup(client, firm_url)
     if soup is None:
-        return None, None, "Адрес не найден", []
+        return None, None, "Адрес не найден", [], None
     name, category, categories = _extract_name_and_categories_from_soup(soup)
-    return name, category, _extract_address_from_soup(soup), categories
+    return name, category, _extract_address_from_soup(soup), categories, _extract_city_from_soup(soup)
 
 
 async def scrape_branch_preview(
@@ -383,7 +437,7 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
     Скрапит адрес + распределение рейтинга + все отзывы одного филиала.
     Возвращает словарь, готовый для upsert в БД.
     """
-    (name, category, address, categories), distribution = await asyncio.gather(
+    (name, category, address, categories, city), distribution = await asyncio.gather(
         scrape_branch_info(client, firm_url),
         fetch_rating_distribution(client, gis_branch_id),
     )
@@ -459,5 +513,6 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
         "total_reviews": final_total,
         "rating_distribution": distribution,
         "url": firm_url,
+        "city": city,
         "reviews": all_reviews,
     }

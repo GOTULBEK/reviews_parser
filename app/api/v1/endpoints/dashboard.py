@@ -8,6 +8,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 import sqlalchemy as sa
 from sqlalchemy import DateTime, and_, bindparam, case, func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_session
@@ -20,6 +21,8 @@ from app.services.topics import ReviewDoc
 
 from app.api.v1.endpoints.tasks import _require_task
 from app.schemas.dashboard import TopicTimeSeries, TopicTimeSeriesPoint
+from app.schemas.cities import TaskCityItem, TaskCityListResponse
+from app.services import cities as cities_service
 
 router = APIRouter()
 
@@ -40,6 +43,85 @@ def _sentiment_from_rating(rating: int | None) -> Literal["pos", "neg", "neu", "
     if rating <= _SENT_NEG_MAX:
         return "neg"
     return "neu"
+
+def _apply_branch_filters(stmt, source: str | None, city: str | None):
+    """Сужает выборку по источнику и городу филиала. 'all'/None — без фильтра.
+
+    Требует, чтобы в запросе уже был join на Branch.
+    """
+    if source and source != "all":
+        stmt = stmt.where(Branch.source == source)
+    if city and city != "all":
+        stmt = stmt.where(Branch.city == city)
+    return stmt
+
+
+def _topics_cache_lookup(task_id: UUID, days: int | None, city: str | None):
+    """Select строки AI-кэша по ключу (task_id, days, city), null-safe.
+
+    Источник (source) НЕ входит в ключ: AI-аналитика считается по всем источникам
+    (source-agnostic), поэтому одна строка обслуживает любой source. Это экономит
+    Claude-вызовы (нет фрагментации кэша по 2gis/zapis/all). Старые строки с NULL
+    city матчатся на city=all через COALESCE — обратная совместимость.
+    """
+    return (
+        select(TaskTopicsCache)
+        .where(
+            TaskTopicsCache.task_id == task_id,
+            func.coalesce(TaskTopicsCache.days, -1) == (int(days) if days is not None else -1),
+            func.coalesce(TaskTopicsCache.city, "all") == (city or "all"),
+        )
+        .order_by(TaskTopicsCache.id.desc())
+        .limit(1)
+    )
+
+
+# Per-(task,days,city) lock: дедуплицирует параллельные первые загрузки дашборда,
+# чтобы AI считался ОДИН раз, а не по razу на каждый одновременный эндпоинт.
+_analysis_locks: dict[tuple, asyncio.Lock] = {}
+_analysis_locks_guard = asyncio.Lock()
+
+
+async def _get_analysis_lock(key: tuple) -> asyncio.Lock:
+    async with _analysis_locks_guard:
+        lk = _analysis_locks.get(key)
+        if lk is None:
+            lk = asyncio.Lock()
+            _analysis_locks[key] = lk
+        return lk
+
+
+async def _write_topics_cache(
+    session: AsyncSession, task_id: UUID, days: int | None, city: str | None, fields: dict
+) -> "TaskTopicsCache | None":
+    """Идемпотентно пишет поля в строку AI-кэша (task,days,city).
+
+    Устойчиво к гонке: при конфликте уникального индекса (другой одновременный
+    запрос уже вставил строку) откатываемся и обновляем существующую. Так дашборд,
+    который параллельно дёргает /overview /recommendations /topics и т.д., не падает
+    с UniqueViolation. Обновляются ТОЛЬКО переданные поля (merge, не затирает чужие).
+    """
+    row = (await session.execute(_topics_cache_lookup(task_id, days, city))).scalars().first()
+    if row is None:
+        row = TaskTopicsCache(
+            task_id=task_id, days=int(days) if days is not None else None, city=city, **fields
+        )
+        session.add(row)
+        try:
+            await session.commit()
+            return row
+        except IntegrityError:
+            await session.rollback()
+            row = (await session.execute(_topics_cache_lookup(task_id, days, city))).scalars().first()
+    if row is not None:
+        for k, v in fields.items():
+            setattr(row, k, v)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+    return row
+
 
 _OVERVIEW_CACHE_TTL_S = 15.0
 _overview_cache = {}
@@ -62,6 +144,7 @@ async def _compute_topic_timeseries(
     topic_bars: list,
     session: AsyncSession,
     source: str,
+    city: str | None = None,
 ) -> list[dict]:
     """Single DB fetch → keyword matching per topic → monthly pos/neg counts."""
     rows = (
@@ -79,15 +162,18 @@ async def _compute_topic_timeseries(
                   AND r.text IS NOT NULL
                   AND r.text != ''
                   AND (:source IS NULL OR b.source = :source)
+                  AND (:city IS NULL OR b.city = :city)
                   AND r.date_created >= (now() - interval '12 months')
             """).bindparams(
                 bindparam("tz", type_=sa.String()),
                 bindparam("source", type_=sa.String()),
+                bindparam("city", type_=sa.String()),
             ),
             {
                 "task_id": task_id,
                 "tz": _OVERVIEW_TZ,
                 "source": source if source and source != "all" else None,
+                "city": city if city and city != "all" else None,
             },
         )
     ).all()
@@ -126,7 +212,8 @@ def _run_topic_extraction_embeddings(docs):
     return extract_topics_embeddings(docs, top_n=8, min_mentions=3)
 
 async def _fetch_reviews_as_dicts(
-    task_id: UUID, session: AsyncSession, since: datetime | None = None, source: Literal["2gis", "zapis", "all"] = "2gis"
+    task_id: UUID, session: AsyncSession, since: datetime | None = None,
+    source: Literal["2gis", "zapis", "all"] = "2gis", city: str | None = None,
 ) -> list[dict]:
     stmt = (
         select(Review.rating, Review.text)
@@ -138,21 +225,21 @@ async def _fetch_reviews_as_dicts(
     )
     if since is not None:
         stmt = stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-    if source is not None and source != "all":
-        stmt = stmt.where(Branch.source == source)
+    stmt = _apply_branch_filters(stmt, source, city)
     rows = (await session.execute(stmt)).all()
     return [{"rating": r.rating, "text": r.text} for r in rows]
 
 
 async def _load_task_top_mentions(
-    task_id: UUID, session: AsyncSession
+    task_id: UUID, session: AsyncSession, city: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Look up cached top_problems/top_praise for the task across all (task_id, days)
-    rows. Returns the first populated pair found. Never calls Claude — the caller
-    decides whether to generate when missing."""
+    rows for the same city (source-agnostic). Returns the first populated pair found.
+    Never calls Claude — the caller decides whether to generate when missing."""
     stmt = (
         select(TaskTopicsCache.top_problems, TaskTopicsCache.top_praise, TaskTopicsCache.days)
         .where(TaskTopicsCache.task_id == task_id)
+        .where(func.coalesce(TaskTopicsCache.city, "all") == (city or "all"))
         .where(
             or_(
                 TaskTopicsCache.top_problems.isnot(None),
@@ -175,7 +262,8 @@ async def _load_task_top_mentions(
 
 
 async def _fetch_reviews_with_dates(
-    task_id: UUID, session: AsyncSession, since: datetime | None = None, source: Literal["2gis", "zapis", "all"] = "2gis"
+    task_id: UUID, session: AsyncSession, since: datetime | None = None,
+    source: Literal["2gis", "zapis", "all"] = "2gis", city: str | None = None,
 ) -> list[dict]:
     stmt = (
         select(Review.rating, Review.text, Review.date_created)
@@ -187,14 +275,114 @@ async def _fetch_reviews_with_dates(
     )
     if since is not None:
         stmt = stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-    if source is not None and source != "all":
-        stmt = stmt.where(Branch.source == source)
+    stmt = _apply_branch_filters(stmt, source, city)
     stmt = stmt.order_by(Review.date_created.desc().nulls_last())
     rows = (await session.execute(stmt)).all()
     return [
         {"rating": r.rating, "text": r.text, "date_created": r.date_created}
         for r in rows
     ]
+
+
+async def _ensure_full_analysis(
+    task_id: UUID, days: int | None, city: str | None, session: AsyncSession, want: str
+) -> "TaskTopicsCache | None":
+    """Гарантирует, что AI-аналитика для (task, days, city) посчитана, и возвращает
+    строку кэша.
+
+    ОДИН вызов Claude (generate_full_analysis) заполняет сразу ВСЕ поля
+    (top_problems/top_praise/problems/priorities/insights/topics_module), поэтому
+    остальные AI-эндпоинты для той же комбинации читают готовое из кэша без новых
+    обращений к Claude — это и есть консолидация 4 вызовов в 1.
+
+    `want` — поле, нужное вызывающему. Если оно уже в кэше, Claude не вызывается.
+    AI считается по всем источникам (source-agnostic).
+    """
+    row = (await session.execute(_topics_cache_lookup(task_id, days, city))).scalars().first()
+    if row is not None and getattr(row, want) is not None:
+        return row
+
+    # Сериализуем вычисление по (task,days,city): один Claude-вызов на комбинацию,
+    # даже если дашборд параллельно дёрнул несколько AI-эндпоинтов сразу.
+    lock = await _get_analysis_lock((str(task_id), days, city or "all"))
+    async with lock:
+        # Двойная проверка: пока ждали лок, другой запрос мог всё посчитать.
+        row = (await session.execute(_topics_cache_lookup(task_id, days, city))).scalars().first()
+        if row is not None and getattr(row, want) is not None:
+            return row
+
+        since: datetime | None = None
+        if days is not None:
+            since = datetime.now(timezone.utc) - timedelta(days=int(days))
+        reviews = await _fetch_reviews_with_dates(task_id, session, since=since, source="all", city=city)
+        full = await claude_service.generate_full_analysis(reviews)
+        if not full:
+            return row
+
+        # Пустые списки сохраняем как есть (маркер «посчитано, пусто»), иначе
+        # эндпоинт будет дёргать Claude снова и снова.
+        return await _write_topics_cache(session, task_id, days, city, {
+            "top_problems": full["top_problems"],
+            "top_praise": full["top_praise"],
+            "problems": full["problems"],
+            "priorities": full["priorities"],
+            "insights": full["insights"],
+            "topics_module": full["topics_module"],
+        })
+
+
+# Dashboard — /cities
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{task_id}/cities",
+    response_model=TaskCityListResponse,
+    tags=["dashboard"],
+    summary="Города, представленные в отчёте (для фильтра city)",
+)
+async def get_task_cities(
+    task_id: UUID,
+    source: Literal["2gis", "zapis", "all"] = Query("all", description="Filter by data source"),
+    session: AsyncSession = Depends(get_session),
+):
+    """Distinct branch cities for this task, each with its branch count.
+
+    Drives the city picker for the dashboard's `city` filter. Slugs match
+    `Branch.city` (e.g. 'almaty') — pass them back as `?city=<slug>`.
+    """
+    await _require_task(task_id, session)
+
+    stmt = (
+        select(Branch.city, func.count(func.distinct(Branch.id)).label("branch_count"))
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
+        .where(SearchTaskBranch.task_id == task_id)
+        .where(Branch.city.isnot(None))
+        .where(Branch.city != "")
+        .group_by(Branch.city)
+    )
+    if source and source != "all":
+        stmt = stmt.where(Branch.source == source)
+    stmt = stmt.order_by(func.count(func.distinct(Branch.id)).desc())
+
+    rows = (await session.execute(stmt)).all()
+
+    # slug -> display name from the KZ catalog (best-effort; unknown slugs keep name=None)
+    try:
+        name_by_slug = {c["slug"]: c["name"] for c in await cities_service.get_cities()}
+    except Exception:
+        logging.exception("Failed to load city catalog for name mapping")
+        name_by_slug = {}
+
+    cities = [
+        TaskCityItem(
+            slug=city,
+            name=name_by_slug.get(city),
+            branch_count=int(branch_count or 0),
+        )
+        for city, branch_count in rows
+    ]
+    return TaskCityListResponse(count=len(cities), cities=cities)
+
 
 # Dashboard — /overview
 # ---------------------------------------------------------------------------
@@ -215,9 +403,10 @@ async def get_overview(
         description="If set, all analytics are computed using reviews from the last N days (by date_created).",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
-    cache_key = (str(task_id), "overview", int(top_branches_limit), int(days) if days is not None else None, source if source and source != "all" else None)
+    cache_key = (str(task_id), "overview", int(top_branches_limit), int(days) if days is not None else None, source if source and source != "all" else None, city if city and city != "all" else None)
     now = monotonic()
 
     async with _overview_lock:
@@ -244,8 +433,7 @@ async def get_overview(
                 .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
                 .where(SearchTaskBranch.task_id == task_id)
             )
-            if source is not None and source != "all":
-                branches_stmt = branches_stmt.where(Branch.source == source)
+            branches_stmt = _apply_branch_filters(branches_stmt, source, city)
                 
             branches = (await session.execute(branches_stmt)).scalars().all()
             branches_total = len(branches)
@@ -267,8 +455,7 @@ async def get_overview(
             )
             if since is not None:
                 agg_stmt = agg_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-            if source is not None and source != "all":
-                agg_stmt = agg_stmt.where(Branch.source == source)
+            agg_stmt = _apply_branch_filters(agg_stmt, source, city)
             row = (await session.execute(agg_stmt)).one()
 
             reviews_total = row.total or 0
@@ -303,8 +490,7 @@ async def get_overview(
             )
             if since is not None:
                 rating_stmt = rating_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-            if source is not None and source != "all":
-                rating_stmt = rating_stmt.where(Branch.source == source)
+            rating_stmt = _apply_branch_filters(rating_stmt, source, city)
                 
             rating_rows = (await session.execute(rating_stmt)).all()
             counts: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
@@ -344,7 +530,7 @@ async def get_overview(
                     gis_branch_id=str(b.gis_branch_id),
                     source=b.source,
                     name=(b.name or "").strip() or f"Филиал {b.gis_branch_id}",
-                    city=task.city,
+                    city=(b.city or task.city),
                     address=(b.address or "").strip() or "Адрес не найден",
                     district=None,
                     lat=None,
@@ -366,17 +552,7 @@ async def get_overview(
                     for b in sorted_branches
                 ]
 
-            from app.models.tasks import TaskTopicsCache
-            cache_stmt = (
-                select(TaskTopicsCache)
-                .where(
-                    TaskTopicsCache.task_id == task_id,
-                    TaskTopicsCache.days == (int(days) if days is not None else None),
-                )
-                .order_by(TaskTopicsCache.id.desc())
-                .limit(1)
-            )
-            topics_cache_row = (await session.execute(cache_stmt)).scalars().first()
+            topics_cache_row = (await session.execute(_topics_cache_lookup(task_id, days, city))).scalars().first()
 
             top_problems: list[TopMention] = []
             top_praise: list[TopMention] = []
@@ -385,7 +561,7 @@ async def get_overview(
                 top_problems = [TopMention(**t) for t in (topics_cache_row.top_problems or []) if isinstance(t, dict)]
                 top_praise = [TopMention(**t) for t in (topics_cache_row.top_praise or []) if isinstance(t, dict)]
             elif topics_cache_row is not None and topics_cache_row.topics_module:
-                # /topics was already called — derive top-5 from the shared cache, no extra Claude call.
+                # /topics already computed — derive top-5 from the shared cache, no Claude call.
                 _module = topics_cache_row.topics_module
                 top_problems = [
                     TopMention(label=t["label"], mentions=t.get("mentions", 0), examples=[])
@@ -398,45 +574,12 @@ async def get_overview(
                     if isinstance(t, dict)
                 ]
             else:
-                # Reuse top_mentions cached on any (task_id, *) row before paying for Claude again.
-                shared_problems, shared_praise = await _load_task_top_mentions(task_id, session)
-                if shared_problems or shared_praise:
-                    top_problems = [TopMention(**t) for t in shared_problems if isinstance(t, dict)]
-                    top_praise = [TopMention(**t) for t in shared_praise if isinstance(t, dict)]
-
-                if not top_problems and not top_praise:
-                    reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
-                    top_problems, top_praise = await claude_service.generate_top_mentions(reviews_dicts)
-
-                    if not top_problems and not top_praise:
-                        topic_docs = [ReviewDoc(id=str(i), text=r["text"], rating=r["rating"]) for i, r in enumerate(reviews_dicts)]
-                        loop = asyncio.get_running_loop()
-                        try:
-                            raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction_embeddings, topic_docs)
-                        except Exception:
-                            logging.exception("Embeddings topic extraction failed, falling back to TF-IDF topics")
-                            raw_problems, raw_praise = await loop.run_in_executor(None, _run_topic_extraction, topic_docs)
-                        top_problems = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_problems]
-                        top_praise = [TopMention(label=t.label, mentions=t.mentions, examples=t.examples) for t in raw_praise]
-
-                if topics_cache_row is None:
-                    topics_cache_row = TaskTopicsCache(
-                        task_id=task_id,
-                        days=int(days) if days is not None else None,
-                        top_problems=[t.model_dump() for t in top_problems] or None,
-                        top_praise=[t.model_dump() for t in top_praise] or None,
-                    )
-                    session.add(topics_cache_row)
-                else:
-                    if not topics_cache_row.top_problems and top_problems:
-                        topics_cache_row.top_problems = [t.model_dump() for t in top_problems]
-                    if not topics_cache_row.top_praise and top_praise:
-                        topics_cache_row.top_praise = [t.model_dump() for t in top_praise]
-                try:
-                    await session.commit()
-                except Exception:
-                    await session.rollback()
-                    logging.exception("Failed to save topics cache")
+                # Cold path: one consolidated Claude call fills top_problems/top_praise
+                # (and the rest), so /problems /actions /topics reuse it for free.
+                row = await _ensure_full_analysis(task_id, days, city, session, "top_problems")
+                if row is not None:
+                    top_problems = [TopMention(**t) for t in (row.top_problems or []) if isinstance(t, dict)]
+                    top_praise = [TopMention(**t) for t in (row.top_praise or []) if isinstance(t, dict)]
 
             if days is not None and int(days) <= 31:
                 # Daily buckets (zero-filled), keyed by local date in _OVERVIEW_TZ.
@@ -456,8 +599,11 @@ scoped_reviews AS (
     r.rating
   FROM reviews r
   JOIN search_task_branches stb ON stb.branch_id = r.branch_id
+  JOIN branches b ON b.id = r.branch_id
   WHERE stb.task_id = :task_id
     AND r.date_created IS NOT NULL
+    AND (:source IS NULL OR b.source = :source)
+    AND (:city IS NULL OR b.city = :city)
     AND (timezone(:tz, r.date_created))::date BETWEEN
       (timezone(:tz, now())::date - (:range_days - 1)) AND timezone(:tz, now())::date
 ),
@@ -481,8 +627,15 @@ FROM days d
 LEFT JOIN agg a USING (day)
 ORDER BY d.day ASC
 """
+                    ).bindparams(
+                        bindparam("source", type_=sa.String()),
+                        bindparam("city", type_=sa.String()),
                     ),
-                    {"task_id": task_id, "tz": _OVERVIEW_TZ, "range_days": int(days), "source": source if source and source != "all" else None},
+                    {
+                        "task_id": task_id, "tz": _OVERVIEW_TZ, "range_days": int(days),
+                        "source": source if source and source != "all" else None,
+                        "city": city if city and city != "all" else None,
+                    },
                 )
 
                 review_dynamics_points = [
@@ -518,8 +671,11 @@ scoped_reviews AS (
   SELECT r.date_created, r.rating
   FROM reviews r
   JOIN search_task_branches stb ON stb.branch_id = r.branch_id
+  JOIN branches b ON b.id = r.branch_id
   WHERE stb.task_id = :task_id
     AND r.date_created IS NOT NULL
+    AND (:source IS NULL OR b.source = :source)
+    AND (:city IS NULL OR b.city = :city)
     AND (:since IS NULL OR r.date_created >= :since)
 ),
 agg AS (
@@ -542,8 +698,16 @@ FROM months m
 LEFT JOIN agg a USING (month_start)
 ORDER BY m.month_start ASC
 """
-                    ).bindparams(bindparam("since", type_=DateTime(timezone=True))),
-                    {"task_id": task_id, "tz": _OVERVIEW_TZ, "since": since, "source": source if source and source != "all" else None},
+                    ).bindparams(
+                        bindparam("since", type_=DateTime(timezone=True)),
+                        bindparam("source", type_=sa.String()),
+                        bindparam("city", type_=sa.String()),
+                    ),
+                    {
+                        "task_id": task_id, "tz": _OVERVIEW_TZ, "since": since,
+                        "source": source if source and source != "all" else None,
+                        "city": city if city and city != "all" else None,
+                    },
                 )
 
                 review_dynamics_points = [
@@ -872,6 +1036,7 @@ async def get_task_branches(
         description="If set, rating/total_reviews/replies_pct/rating_distribution are computed using reviews from the last N days (by date_created).",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -920,9 +1085,8 @@ async def get_task_branches(
         .where(SearchTaskBranch.task_id == task_id)
     )
 
-    if source is not None and source != "all":
-        stmt = stmt.where(Branch.source == source)
-        count_stmt = count_stmt.where(Branch.source == source)
+    stmt = _apply_branch_filters(stmt, source, city)
+    count_stmt = _apply_branch_filters(count_stmt, source, city)
 
     total = (await session.execute(count_stmt)).scalar_one()
 
@@ -1016,6 +1180,7 @@ async def get_task_reviews(
         description="If set, returns only reviews from the last N days (by date_created).",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -1049,6 +1214,8 @@ async def get_task_reviews(
         
     if source is not None and source != "all":
         where_clauses.append(Branch.source == source)
+    if city and city != "all":
+        where_clauses.append(Branch.city == city)
 
     base_from = (
         Review.__table__
@@ -1118,45 +1285,14 @@ async def get_task_problems(
         description="If set, problems are generated using reviews from the last N days (by date_created).",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
-    since: datetime | None = None
-    if days is not None:
-        since = datetime.now(timezone.utc) - timedelta(days=int(days))
-        
-    cache_stmt = (
-        select(TaskTopicsCache)
-        .where(
-            TaskTopicsCache.task_id == task_id,
-            TaskTopicsCache.days == (int(days) if days is not None else None),
-        )
-        .order_by(TaskTopicsCache.id.desc())
-        .limit(1)
-    )
-    topics_cache_row = (await session.execute(cache_stmt)).scalars().first()
 
-    if topics_cache_row is not None and topics_cache_row.problems is not None:
-        problems = [ProblemItem(**p) for p in topics_cache_row.problems]
-    else:
-        reviews = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
-        problems = await claude_service.generate_problems(reviews)
-        
-        if topics_cache_row is None:
-            new_cache = TaskTopicsCache(
-                task_id=task_id,
-                days=int(days) if days is not None else None,
-                problems=[p.model_dump() for p in problems]
-            )
-            session.add(new_cache)
-        else:
-            topics_cache_row.problems = [p.model_dump() for p in problems]
-            
-        try:
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            logging.exception("Failed to save problems cache")
+    # Один консолидированный Claude-вызов заполняет все AI-поля; здесь берём problems.
+    row = await _ensure_full_analysis(task_id, days, city, session, "problems")
+    problems = [ProblemItem(**p) for p in (row.problems or [])] if row else []
 
     note = (
         "Generated by Claude AI based on negative/neutral reviews."
@@ -1190,48 +1326,15 @@ async def get_task_actions(
         description="If set, actions are generated using reviews from the last N days (by date_created).",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
-    since: datetime | None = None
-    if days is not None:
-        since = datetime.now(timezone.utc) - timedelta(days=int(days))
-        
-    cache_stmt = (
-        select(TaskTopicsCache)
-        .where(
-            TaskTopicsCache.task_id == task_id,
-            TaskTopicsCache.days == (int(days) if days is not None else None),
-        )
-        .order_by(TaskTopicsCache.id.desc())
-        .limit(1)
-    )
-    topics_cache_row = (await session.execute(cache_stmt)).scalars().first()
 
-    if topics_cache_row is not None and topics_cache_row.priorities is not None and topics_cache_row.insights is not None:
-        priorities = [PriorityItem(**p) for p in topics_cache_row.priorities]
-        insights = [InsightItem(**i) for i in topics_cache_row.insights]
-    else:
-        reviews = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
-        priorities, insights = await claude_service.generate_actions(reviews)
-        
-        if topics_cache_row is None:
-            new_cache = TaskTopicsCache(
-                task_id=task_id,
-                days=int(days) if days is not None else None,
-                priorities=[p.model_dump() for p in priorities],
-                insights=[i.model_dump() for i in insights]
-            )
-            session.add(new_cache)
-        else:
-            topics_cache_row.priorities = [p.model_dump() for p in priorities]
-            topics_cache_row.insights = [i.model_dump() for i in insights]
-            
-        try:
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            logging.exception("Failed to save actions cache")
+    # Один консолидированный Claude-вызов; здесь берём priorities + insights.
+    row = await _ensure_full_analysis(task_id, days, city, session, "priorities")
+    priorities = [PriorityItem(**p) for p in (row.priorities or [])] if row else []
+    insights = [InsightItem(**i) for i in (row.insights or [])] if row else []
 
     return ActionsResponse(
         task_id=task.id,
@@ -1263,6 +1366,7 @@ async def get_task_recommendations(
         description="If set, recommendations are generated from reviews of the last N days.",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -1270,15 +1374,7 @@ async def get_task_recommendations(
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
 
-    cache_stmt = (
-        select(TaskTopicsCache)
-        .where(
-            TaskTopicsCache.task_id == task_id,
-            TaskTopicsCache.days == (int(days) if days is not None else None),
-        )
-        .order_by(TaskTopicsCache.id.desc())
-        .limit(1)
-    )
+    cache_stmt = _topics_cache_lookup(task_id, days, city)
     cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     if cache_row is not None and cache_row.recommendations is not None:
@@ -1305,8 +1401,7 @@ async def get_task_recommendations(
     )
     if since is not None:
         agg_stmt = agg_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-    if source is not None and source != "all":
-        agg_stmt = agg_stmt.where(Branch.source == source)
+    agg_stmt = _apply_branch_filters(agg_stmt, source, city)
     agg_row = (await session.execute(agg_stmt)).one()
 
     reviews_total = int(agg_row.total or 0)
@@ -1325,7 +1420,7 @@ async def get_task_recommendations(
 
     if not top_problems_raw and not top_praise_raw:
         # Try shared top_mentions cache first.
-        top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session)
+        top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session, city)
 
     if not top_problems_raw and not top_praise_raw:
         # Try deriving from topics_module cache (populated by /topics endpoint).
@@ -1333,6 +1428,7 @@ async def get_task_recommendations(
             await session.execute(
                 select(TaskTopicsCache)
                 .where(TaskTopicsCache.task_id == task_id)
+                .where(func.coalesce(TaskTopicsCache.city, "all") == (city or "all"))
                 .where(TaskTopicsCache.topics_module.isnot(None))
                 .order_by(TaskTopicsCache.id.desc())
                 .limit(1)
@@ -1352,36 +1448,18 @@ async def get_task_recommendations(
             ]
 
     if not top_problems_raw and not top_praise_raw:
-        # Last resort: generate top mentions fresh from reviews.
-        reviews_dicts = await _fetch_reviews_as_dicts(task_id, session, since=since, source=source)
-        _problems_list, _praise_list = await claude_service.generate_top_mentions(reviews_dicts)
-        top_problems_raw = [t.model_dump() for t in _problems_list]
-        top_praise_raw = [t.model_dump() for t in _praise_list]
+        # Last resort: consolidated analysis fills top_mentions (shared with all AI endpoints).
+        full_row = await _ensure_full_analysis(task_id, days, city, session, "top_problems")
+        if full_row is not None:
+            top_problems_raw = list(full_row.top_problems or [])
+            top_praise_raw = list(full_row.top_praise or [])
 
     items = await claude_service.generate_recommendations(top_problems_raw, top_praise_raw, kpis)
 
     payload = [i.model_dump() for i in items]
-    if cache_row is None:
-        new_cache = TaskTopicsCache(
-            task_id=task_id,
-            days=int(days) if days is not None else None,
-            top_problems=top_problems_raw or None,
-            top_praise=top_praise_raw or None,
-            recommendations=payload,
-        )
-        session.add(new_cache)
-    else:
-        cache_row.recommendations = payload
-        if not cache_row.top_problems and top_problems_raw:
-            cache_row.top_problems = top_problems_raw
-        if not cache_row.top_praise and top_praise_raw:
-            cache_row.top_praise = top_praise_raw
-
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        logging.exception("Failed to save recommendations cache")
+    # Конфликт-безопасная запись: только своё поле, не затирая чужие (top_problems
+    # и пр. владеет _ensure_full_analysis).
+    await _write_topics_cache(session, task_id, days, city, {"recommendations": payload})
 
     return RecommendationsResponse(
         task_id=task.id,
@@ -1410,6 +1488,7 @@ async def get_task_topics_module(
         description="If set, topics are derived from reviews of the last N days.",
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -1417,20 +1496,11 @@ async def get_task_topics_module(
     if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=int(days))
 
-    cache_stmt = (
-        select(TaskTopicsCache)
-        .where(
-            TaskTopicsCache.task_id == task_id,
-            TaskTopicsCache.days == (int(days) if days is not None else None),
-        )
-        .order_by(TaskTopicsCache.id.desc())
-        .limit(1)
+    # Один консолидированный Claude-вызов заполняет topics_module (если ещё не посчитан).
+    cache_row = await _ensure_full_analysis(task_id, days, city, session, "topics_module")
+    cached: dict | None = (
+        cache_row.topics_module if (cache_row is not None and cache_row.topics_module is not None) else None
     )
-    cache_row = (await session.execute(cache_stmt)).scalars().first()
-
-    cached: dict | None = None
-    if cache_row is not None and cache_row.topics_module is not None:
-        cached = cache_row.topics_module
 
     # reviews_total for the same window/source (deterministic, cheap)
     count_stmt = (
@@ -1444,8 +1514,7 @@ async def get_task_topics_module(
     )
     if since is not None:
         count_stmt = count_stmt.where(Review.date_created.isnot(None)).where(Review.date_created >= since)
-    if source is not None and source != "all":
-        count_stmt = count_stmt.where(Branch.source == source)
+    count_stmt = _apply_branch_filters(count_stmt, source, city)
     reviews_total = int((await session.execute(count_stmt)).scalar_one() or 0)
 
     # Monthly average rating (always computed, never via Claude). Last 12 months in TZ.
@@ -1469,6 +1538,7 @@ agg AS (
   WHERE stb.task_id = :task_id
     AND r.date_created IS NOT NULL
     AND (:source IS NULL OR b.source = :source)
+    AND (:city IS NULL OR b.city = :city)
   GROUP BY 1
 )
 SELECT
@@ -1481,8 +1551,13 @@ ORDER BY m.month_start ASC
         ).bindparams(
             bindparam("tz", type_=sa.String()),
             bindparam("source", type_=sa.String()),
+            bindparam("city", type_=sa.String()),
         ),
-        {"task_id": task_id, "tz": _OVERVIEW_TZ, "source": source if source and source != "all" else None},
+        {
+            "task_id": task_id, "tz": _OVERVIEW_TZ,
+            "source": source if source and source != "all" else None,
+            "city": city if city and city != "all" else None,
+        },
     )
     monthly_avg_rating = [
         MonthlyAvgRatingPoint(
@@ -1502,7 +1577,7 @@ ORDER BY m.month_start ASC
         # Timeseries may be missing from older cache rows — compute and persist it on-demand.
         _ts_raw = cached.get("topic_timeseries")
         if _ts_raw is None and topic_bars:
-            _ts_raw = await _compute_topic_timeseries(task_id, topic_bars, session, source)
+            _ts_raw = await _compute_topic_timeseries(task_id, topic_bars, session, "all", city)
             try:
                 cache_row.topics_module = {**cached, "topic_timeseries": _ts_raw}
                 await session.commit()
@@ -1510,50 +1585,12 @@ ORDER BY m.month_start ASC
                 await session.rollback()
         topic_timeseries = [TopicTimeSeries(**t) for t in (_ts_raw or [])]
     else:
-        reviews = await _fetch_reviews_with_dates(task_id, session, since=since, source=source)
-        result = await claude_service.generate_topics_module(reviews)
-        if result is None:
-            topic_bars, top_positive, top_negative = [], [], []
-            frequent_phrases = []
-            fgn = None
-            sp = None
-            topic_timeseries = []
-        else:
-            topic_bars = [TopicBarItem(**t) for t in result["topic_bars"]]
-            top_positive = [TopicListItem(**t) for t in result["top_positive"]]
-            top_negative = [TopicListItem(**t) for t in result["top_negative"]]
-            frequent_phrases = list(result["frequent_phrases"])
-            fgn = TopicTrend(**result["fastest_growing_negative"]) if result.get("fastest_growing_negative") else None
-            sp = TopicTrend(**result["strongest_positive"]) if result.get("strongest_positive") else None
-
-            _ts_raw = await _compute_topic_timeseries(task_id, topic_bars, session, source)
-            topic_timeseries = [TopicTimeSeries(**t) for t in _ts_raw]
-
-            payload = {
-                "topic_bars": [t.model_dump() for t in topic_bars],
-                "top_positive": [t.model_dump() for t in top_positive],
-                "top_negative": [t.model_dump() for t in top_negative],
-                "frequent_phrases": frequent_phrases,
-                "fastest_growing_negative": fgn.model_dump() if fgn else None,
-                "strongest_positive": sp.model_dump() if sp else None,
-                "topic_timeseries": _ts_raw,
-            }
-
-            if cache_row is None:
-                cache_row = TaskTopicsCache(
-                    task_id=task_id,
-                    days=int(days) if days is not None else None,
-                    topics_module=payload,
-                )
-                session.add(cache_row)
-            else:
-                cache_row.topics_module = payload
-
-            try:
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                logging.exception("Failed to save topics_module cache")
+        # _ensure_full_analysis не смог посчитать (нет ключа/отзывов/сбой) — пусто.
+        topic_bars, top_positive, top_negative = [], [], []
+        frequent_phrases = []
+        fgn = None
+        sp = None
+        topic_timeseries = []
 
     topics_count = len(topic_bars)
 
@@ -1609,6 +1646,7 @@ async def get_task_replies_module(
         "negative_first", "newest_first", "oldest_first", "urgent_first"
     ] = Query("negative_first", description="Queue ordering."),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -1622,6 +1660,8 @@ async def get_task_replies_module(
         base_filters.append(Review.date_created >= since)
     if source is not None and source != "all":
         base_filters.append(Branch.source == source)
+    if city and city != "all":
+        base_filters.append(Branch.city == city)
 
     base_join = (
         select(Review)
@@ -1783,15 +1823,7 @@ async def get_task_replies_module(
         )
 
     # Templates — Claude-generated and cached per (task_id, days).
-    cache_stmt = (
-        select(TaskTopicsCache)
-        .where(
-            TaskTopicsCache.task_id == task_id,
-            TaskTopicsCache.days == (int(days) if days is not None else None),
-        )
-        .order_by(TaskTopicsCache.id.desc())
-        .limit(1)
-    )
+    cache_stmt = _topics_cache_lookup(task_id, days, city)
     cache_row = (await session.execute(cache_stmt)).scalars().first()
 
     templates: list[ReplyTemplate] = []
@@ -1801,32 +1833,12 @@ async def get_task_replies_module(
         top_problems_raw: list[dict] = list(cache_row.top_problems or []) if cache_row else []
         top_praise_raw: list[dict] = list(cache_row.top_praise or []) if cache_row else []
         if not top_problems_raw and not top_praise_raw:
-            top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session)
+            top_problems_raw, top_praise_raw = await _load_task_top_mentions(task_id, session, city)
 
         templates = await claude_service.generate_reply_templates(top_problems_raw, top_praise_raw)
         payload = [t.model_dump() for t in templates]
-
-        if cache_row is None:
-            cache_row = TaskTopicsCache(
-                task_id=task_id,
-                days=int(days) if days is not None else None,
-                top_problems=top_problems_raw or None,
-                top_praise=top_praise_raw or None,
-                reply_templates=payload,
-            )
-            session.add(cache_row)
-        else:
-            cache_row.reply_templates = payload
-            if not cache_row.top_problems and top_problems_raw:
-                cache_row.top_problems = top_problems_raw
-            if not cache_row.top_praise and top_praise_raw:
-                cache_row.top_praise = top_praise_raw
-
-        try:
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            logging.exception("Failed to save reply_templates cache")
+        # Конфликт-безопасная запись только своего поля.
+        await _write_topics_cache(session, task_id, days, city, {"reply_templates": payload})
 
     return RepliesModuleResponse(
         task_id=task.id,
@@ -1856,18 +1868,19 @@ from app.models.core import Company
 async def get_compare(
     task_id: UUID,
     grouped: bool = Query(False, description="Если True, филиалы одной компании объединяются"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty); 'all' = auto-detect from task"),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
 
-    target_branches = (
-        await session.execute(
-            select(Branch).join(SearchTaskBranch).where(SearchTaskBranch.task_id == task_id)
-        )
-    ).scalars().all()
+    target_stmt = select(Branch).join(SearchTaskBranch).where(SearchTaskBranch.task_id == task_id)
+    if city and city != "all":
+        target_stmt = target_stmt.where(Branch.city == city)
+    target_branches = (await session.execute(target_stmt)).scalars().all()
 
     if not target_branches:
-        raise HTTPException(status_code=404, detail="No branches found in task")
+        detail = f"No branches found in task for city '{city}'" if city and city != "all" else "No branches found in task"
+        raise HTTPException(status_code=404, detail=detail)
 
     target_company_ids = {b.company_id for b in target_branches}
     target_branch_ids = {b.id for b in target_branches}
@@ -1882,7 +1895,7 @@ async def get_compare(
             target_categories.append(b.category)
     target_categories = list(dict.fromkeys(target_categories))  # dedupe, preserve order
 
-    target_city = next((b.city for b in target_branches if b.city), None)
+    target_city = city if (city and city != "all") else next((b.city for b in target_branches if b.city), None)
 
     if grouped:
         stmt = (
@@ -2054,8 +2067,12 @@ async def get_compare(
             meter_pct=92 if best_target["rank"] == 1 else 78
         ))
 
-    # Check TaskTopicsCache for top_praise
-    cache_stmt = select(TaskTopicsCache).where(TaskTopicsCache.task_id == task_id)
+    # Check TaskTopicsCache for top_praise (scoped to the same city)
+    cache_stmt = (
+        select(TaskTopicsCache)
+        .where(TaskTopicsCache.task_id == task_id)
+        .where(func.coalesce(TaskTopicsCache.city, "all") == (city or "all"))
+    )
     cache = (await session.execute(cache_stmt)).scalars().first()
     if cache and cache.top_praise:
         for praise in cache.top_praise[:2]:

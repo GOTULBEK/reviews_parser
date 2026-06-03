@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends
 from app.api.dependencies import require_admin, require_task_access
 from .endpoints.auth import router as auth_router
 from .endpoints.search import router as search_router
+from .endpoints.cities import router as cities_router
 from .endpoints.tasks import router as tasks_router
 from .endpoints.dashboard import router as dashboard_router
 from .endpoints.system import router as system_router
@@ -17,6 +18,13 @@ api_router.include_router(
     search_router,
     prefix="/search",
     tags=["search"],
+    dependencies=[Depends(require_admin)],
+)
+
+# Admin-only: city catalog for the search dropdown
+api_router.include_router(
+    cities_router,
+    tags=["cities"],
     dependencies=[Depends(require_admin)],
 )
 

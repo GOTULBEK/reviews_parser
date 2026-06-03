@@ -34,10 +34,11 @@ async def search_branches(
         res.raise_for_status()
         data = res.json()
         firms = data.get("data", {}).get("firms", [])
-        
-        # Limit to max_branches
-        firms = firms[:max_branches]
-        
+
+        # max_branches <= 0 → без лимита (отдаём всё, что вернул zapis за один запрос)
+        if max_branches > 0:
+            firms = firms[:max_branches]
+
         return [
             {
                 "gis_branch_id": str(firm["id"]),

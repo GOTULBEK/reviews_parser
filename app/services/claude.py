@@ -40,7 +40,6 @@ def _format_reviews_for_prompt(reviews: list[dict]) -> str:
         if r.get('text'):
             rating = r.get('rating') or '?'
             lines.append(f"[Rating: {rating}/5] {r['text']}")
-            lines.append(f"[Rating: {rating}/5] {r['text']}")
     return "\n".join(lines)
 
 
@@ -548,6 +547,303 @@ async def generate_recommendations(
     except Exception:
         logger.exception("Claude API failed during recommendations extraction")
         return []
+
+
+def _evenly(items: list, k: int) -> list:
+    """Возвращает k элементов, равномерно растянутых по списку (сохраняет
+    хронологический разброс, т.к. reviews идут по дате). k<=0 → []; k>=len → все."""
+    if k <= 0:
+        return []
+    if k >= len(items):
+        return items
+    step = len(items) / k
+    return [items[int(i * step)] for i in range(k)]
+
+
+def _select_reviews_for_analysis(reviews: list[dict]) -> list[dict]:
+    """Умная выборка для консолидированного анализа: ВСЕ негативы (несут сигнал
+    для problems/topics) + позитивы/нейтралы по остаточному бюджету. Итог ≤
+    max_reviews_to_analyze, поэтому крупные корпуса не раздувают токены.
+
+    Негативы (≤2) приоритетны; затем позитивы (≥4) — чтобы у topic_bars были
+    осмысленные положительные счётчики; нейтралы (3/без оценки) — в последнюю очередь.
+    """
+    cap = settings.max_reviews_to_analyze
+    neg, neu, pos = [], [], []
+    for r in reviews:
+        rt = r.get("rating")
+        if rt is not None and rt <= 2:
+            neg.append(r)
+        elif rt is not None and rt >= 4:
+            pos.append(r)
+        else:
+            neu.append(r)
+
+    neg = _evenly(neg, min(len(neg), cap))      # на случай экстремума негативов
+    budget = cap - len(neg)
+    pos_keep = min(len(pos), budget)
+    neu_keep = min(len(neu), budget - pos_keep)
+    return neg + _evenly(pos, pos_keep) + _evenly(neu, neu_keep)
+
+
+def _topmention_schema(desc: str) -> dict:
+    return {
+        "type": "array",
+        "description": desc,
+        "items": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Short canonical term in lemma form"},
+                "mentions": {"type": "integer", "description": "Estimated number of reviews mentioning this"},
+                "examples": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "2-3 verbatim short quotes from reviews",
+                },
+            },
+            "required": ["label", "mentions", "examples"],
+        },
+    }
+
+
+async def generate_full_analysis(reviews: list[dict]) -> dict | None:
+    """ОДИН вызов Claude, который заменяет 4 раздельных (top_mentions, problems,
+    actions, topics_module). Корпус отзывов отправляется ОДИН раз вместо четырёх —
+    это главный рычаг снижения стоимости.
+
+    Возвращает dict со всеми под-результатами или None (нет ключа/отзывов/сбой):
+      top_problems, top_praise           — list[TopMention-dict]
+      problems                           — list[ProblemItem-dict]
+      priorities, insights               — list[...]-dict
+      topics_module                      — dict (topic_bars/top_positive/top_negative/
+                                           frequent_phrases/fastest_growing_negative/strongest_positive)
+    """
+    if not client:
+        logger.warning("Anthropic API key missing. Skipping full analysis.")
+        return None
+    if not reviews:
+        return None
+
+    sampled = _select_reviews_for_analysis(reviews)
+    logger.info("Full analysis: %d reviews → %d sampled (all negatives + capped positives)", len(reviews), len(sampled))
+    reviews_text = _format_reviews_with_dates(sampled)
+
+    topic_list_item = {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string"},
+            "sentiment": {"type": "string", "enum": ["pos", "neg", "neu"]},
+            "mentions": {"type": "integer", "minimum": 0},
+        },
+        "required": ["label", "sentiment", "mentions"],
+    }
+    topic_trend = {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string"},
+            "description": {"type": "string", "description": "One sentence in Russian (cite a number if obvious)."},
+        },
+        "required": ["label", "description"],
+    }
+
+    tool_schema = {
+        "name": "analyze_reviews",
+        "description": (
+            "Comprehensive analysis of customer reviews in a single pass. Extract recurring "
+            "complaint/praise topics, detailed problems with quotes, a strategic action plan, "
+            "and a topic-cluster module. Labels in Russian, lemma form, lowercase. "
+            "Quote verbatim — never invent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "top_problems": _topmention_schema("Recurring complaint topics, sorted by frequency. Up to 8."),
+                "top_praise": _topmention_schema("Recurring praise topics, sorted by frequency. Up to 8."),
+                "problems": {
+                    "type": "array",
+                    "description": "The most critical recurring problems with evidence and a fix.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string", "description": "Short slug, e.g. 'long_queues'"},
+                            "title": {"type": "string"},
+                            "mentions": {"type": "integer"},
+                            "quotes": {"type": "array", "items": {"type": "string"}, "description": "1-3 verbatim quotes"},
+                            "recommendation": {"type": "string"},
+                            "kpi_hint": {"type": "string"},
+                        },
+                        "required": ["key", "title", "mentions", "quotes"],
+                    },
+                },
+                "priorities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "level": {"type": "integer", "description": "1 (Urgent) to 3 (Low)"},
+                            "title": {"type": "string"},
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["level", "title", "items"],
+                    },
+                },
+                "insights": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "value": {"type": "string"},
+                            "subtext": {"type": "string"},
+                        },
+                        "required": ["label", "value"],
+                    },
+                },
+                "topic_bars": {
+                    "type": "array", "minItems": 4, "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "positive": {"type": "integer", "minimum": 0},
+                            "negative": {"type": "integer", "minimum": 0},
+                        },
+                        "required": ["label", "positive", "negative"],
+                    },
+                },
+                "top_positive": {"type": "array", "minItems": 3, "maxItems": 6, "items": topic_list_item},
+                "top_negative": {"type": "array", "minItems": 3, "maxItems": 6, "items": topic_list_item},
+                "frequent_phrases": {
+                    "type": "array", "minItems": 4, "maxItems": 10, "items": {"type": "string"},
+                    "description": "Short verbatim phrases (2-4 words each).",
+                },
+                "fastest_growing_negative": topic_trend,
+                "strongest_positive": topic_trend,
+            },
+            "required": [
+                "top_problems", "top_praise", "problems", "priorities", "insights",
+                "topic_bars", "top_positive", "top_negative", "frequent_phrases",
+                "fastest_growing_negative", "strongest_positive",
+            ],
+        },
+    }
+
+    try:
+        response = await _call_anthropic(
+            model=settings.claude_model,
+            max_tokens=8000,
+            temperature=0.2,
+            system=(
+                "You are a strict data analyst for customer reviews. Each review is prefixed by "
+                "[YYYY-MM | rating/5]. Group semantically similar complaints/compliments into clear "
+                "topics. Russian labels in lemma (dictionary) form, lowercase. The fastest-growing "
+                "negative topic is the negative cluster whose share rose most in the most recent month "
+                "vs the prior period. The strongest positive topic co-occurs most with 5/5 ratings. "
+                "Never invent quotes — extract them verbatim. Return up to 8 items per topic list, "
+                "sorted by mention count descending."
+            ),
+            messages=[{"role": "user", "content": f"Analyze these reviews:\n\n{reviews_text}"}],
+            tools=[tool_schema],
+            tool_choice={"type": "tool", "name": "analyze_reviews"},
+        )
+
+        data = _extract_tool_input(response)
+        if not data:
+            return None
+
+        def _mentions(key: str) -> list[dict]:
+            out = []
+            for item in _coerce_dict_list(data.get(key)):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    out.append(TopMention(**item).model_dump())
+                except (ValidationError, TypeError) as e:
+                    logger.warning("Skipping malformed %s: %s (%s)", key, item, e)
+            return out
+
+        problems = []
+        for item in _coerce_dict_list(data.get("problems")):
+            if isinstance(item, dict):
+                try:
+                    problems.append(ProblemItem(**item).model_dump())
+                except (ValidationError, TypeError) as e:
+                    logger.warning("Skipping malformed problem: %s (%s)", item, e)
+
+        priorities = []
+        for p in _coerce_dict_list(data.get("priorities")):
+            if isinstance(p, dict):
+                try:
+                    priorities.append(PriorityItem(**p).model_dump())
+                except (ValidationError, TypeError) as e:
+                    logger.warning("Skipping malformed priority: %s (%s)", p, e)
+
+        insights = []
+        for i in _coerce_dict_list(data.get("insights")):
+            if isinstance(i, dict):
+                try:
+                    insights.append(InsightItem(**i).model_dump())
+                except (ValidationError, TypeError) as e:
+                    logger.warning("Skipping malformed insight: %s (%s)", i, e)
+
+        topic_bars = []
+        for it in _coerce_dict_list(data.get("topic_bars")):
+            if isinstance(it, dict):
+                try:
+                    topic_bars.append(TopicBarItem(**it).model_dump())
+                except (ValidationError, TypeError) as e:
+                    logger.warning("Skipping malformed topic_bar: %s (%s)", it, e)
+
+        top_positive = []
+        for it in _coerce_dict_list(data.get("top_positive")):
+            if isinstance(it, dict):
+                try:
+                    top_positive.append(TopicListItem(**it).model_dump())
+                except (ValidationError, TypeError):
+                    pass
+        top_negative = []
+        for it in _coerce_dict_list(data.get("top_negative")):
+            if isinstance(it, dict):
+                try:
+                    top_negative.append(TopicListItem(**it).model_dump())
+                except (ValidationError, TypeError):
+                    pass
+
+        phrases_raw = data.get("frequent_phrases")
+        if isinstance(phrases_raw, str):
+            try:
+                phrases_raw = json.loads(phrases_raw)
+            except Exception:
+                phrases_raw = []
+        frequent_phrases = [p.strip() for p in (phrases_raw or []) if isinstance(p, str) and p.strip()]
+
+        def _trend(key: str):
+            raw = data.get(key)
+            if isinstance(raw, dict):
+                try:
+                    return TopicTrend(**raw).model_dump()
+                except ValidationError:
+                    return None
+            return None
+
+        return {
+            "top_problems": _mentions("top_problems"),
+            "top_praise": _mentions("top_praise"),
+            "problems": problems,
+            "priorities": priorities,
+            "insights": insights,
+            "topics_module": {
+                "topic_bars": topic_bars,
+                "top_positive": top_positive,
+                "top_negative": top_negative,
+                "frequent_phrases": frequent_phrases,
+                "fastest_growing_negative": _trend("fastest_growing_negative"),
+                "strongest_positive": _trend("strongest_positive"),
+            },
+        }
+
+    except Exception:
+        logger.exception("Claude API failed during full analysis")
+        return None
 
 
 def _format_reviews_with_dates(reviews: list[dict]) -> str:
