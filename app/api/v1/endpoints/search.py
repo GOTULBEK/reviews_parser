@@ -58,7 +58,8 @@ async def search_preview(payload: PreviewRequest):
             try:
                 if not all_cities:
                     return await scraper.search_branches(
-                        client, payload.query, payload.city, payload.max_results
+                        client, payload.query, payload.city, payload.max_results,
+                        deep=payload.deep_search,
                     )
                 # city="all": ищем в каждом городе, но с ограничением параллелизма,
                 # иначе 2ГИС троттлит весь залп. Затем round-robin до max_results.
@@ -81,7 +82,8 @@ async def search_preview(payload: PreviewRequest):
                 async def _one_city(c: str):
                     async with city_sem:
                         return await scraper.search_branches(
-                            client, payload.query, c, per_city_limit
+                            client, payload.query, c, per_city_limit,
+                            deep=payload.deep_search,
                         )
 
                 per_city = await asyncio.gather(*(_one_city(c) for c in target_cities))

@@ -11,6 +11,10 @@ class PreviewRequest(BaseModel):
     # (по всем городам при city="all"). Может быть медленно/тяжело для широких запросов.
     max_results: int = Field(default=20, ge=0, le=10000)
     source: typing.Literal["2gis", "zapis", "all"] = Field(default="2gis")
+    # deep_search — обойти лимит 2ГИС ~60 фирм на запрос: добрать остаток уточняющими
+    # под-запросами по рубрикам (без API-ключа). Медленнее и больше запросов к 2ГИС;
+    # полнота best-effort. Действует только для source 2gis/all.
+    deep_search: bool = Field(default=False)
 
 class BranchPreviewItem(BaseModel):
     gis_branch_id: BranchIdStr

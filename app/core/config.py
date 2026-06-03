@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Бэкстоп от зацикливания пагинации при max_results=0 (без лимита).
     # ~12 фирм/страница → 200 страниц ≈ 2400 фирм на город. 2ГИС обычно отдаёт меньше.
     search_max_pages_hard_cap: int = 200
+    # Deep-search: 2ГИС отдаёт максимум ~60 фирм на текстовый запрос. Чтобы добрать
+    # остаток без ключа, шлём уточняющие под-запросы "{query} {рубрика}" по фасетам
+    # рубрик со страницы поиска. Сколько рубрик максимум обходить (бэкстоп нагрузки).
+    deep_search_max_rubrics: int = 16
     request_timeout_seconds: int = 15
     rate_limit_sleep_min: float = 1.0
     rate_limit_sleep_max: float = 2.0

@@ -65,30 +65,71 @@ async def _get_with_retry(
         logger.error("Search GET gave up after %d attempts: %r", attempts, last_exc)
     return None
 
-async def search_branches(
-    client: httpx.AsyncClient, query: str, city: str, max_branches: int
-) -> list[dict]:
+def _parse_search_total(html: str) -> int | None:
+    """Достаёт заявленное 2ГИС число результатов (`"total":NN`) со страницы поиска.
+
+    2ГИС знает реальное количество (напр. 83), но отдаёт через HTML максимум ~60.
+    Нужно, чтобы понять, есть ли смысл добирать остаток deep-под-запросами.
     """
-    Ищет филиалы по текстовому запросу через HTML страницы поиска 2ГИС.
+    m = re.search(r'"total":(\d+)', html)
+    return int(m.group(1)) if m else None
 
-    ХРУПКИЙ КОМПОНЕНТ: зависит от разметки 2ГИС. Если поиск вернет 0, см. README —
-    скорее всего 2ГИС поменял рендеринг или страница требует JS-гидрации.
 
-    Единственная зацепка — регулярка на паттерн `/firm/<digits>` в HTML.
-    Дубли убираются, порядок первого появления сохраняется (соответствует выдаче).
+def _parse_rubric_facets(html: str, limit: int) -> list[str]:
+    """Извлекает названия рубрик-фасетов (`"rubrics":[{... "count":N}]`) из HTML поиска.
+
+    Эти рубрики 2ГИС считает по текущему запросу (напр. Банкоматы=63, Банки=12).
+    Возвращаем их имена — для уточняющих под-запросов "{query} {рубрика}", чтобы
+    обойти лимит ~60 фирм на запрос. По убыванию count, без дублей, не более limit.
     """
-    seen: set[int] = set()
-    ordered: list[int] = []
+    facets: dict[str, int] = {}
+    for m in re.finditer(r'"rubrics":\[', html):
+        start = m.end() - 1
+        depth = 0
+        i = start
+        # Ручной матчинг скобок: вложенный JSON нельзя взять регуляркой.
+        while i < len(html):
+            ch = html[i]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        chunk = html[start : i + 1]
+        if '"count"' not in chunk or len(chunk) > 8000:
+            continue
+        try:
+            arr = json.loads(chunk)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        for x in arr:
+            if isinstance(x, dict) and x.get("count") and x.get("name"):
+                name = str(x["name"]).strip()
+                if name:
+                    facets[name] = max(facets.get(name, 0), int(x["count"]))
+    return [name for name, _ in sorted(facets.items(), key=lambda kv: kv[1], reverse=True)][:limit]
 
-    # max_branches <= 0 → "без лимита": собираем всё, что 2ГИС отдаёт по запросу,
-    # пока не закончится пагинация (404/410). page-бэкстоп страхует от зацикливания.
-    unlimited = max_branches <= 0
-    page_cap = settings.search_max_pages_hard_cap
 
-    # 2GIS search pages:
-    # - page 1: /{city}/search/{query}
-    # - page N: /{city}/search/{query}/page/{N}/
+async def _collect_query_firm_ids(
+    client: httpx.AsyncClient,
+    query: str,
+    city: str,
+    *,
+    seen: set[int],
+    ordered: list[int],
+    max_branches: int,
+    unlimited: bool,
+    page_cap: int,
+) -> str | None:
+    """Пагинирует один текстовый запрос, добавляя НОВЫЕ firm-id в seen/ordered.
+
+    Возвращает HTML первой страницы (для разбора фасетов/total) или None.
+    seen/ordered — общие на серию запросов, поэтому дедуп работает между ними.
+    """
     safe_query = quote(query, safe="")
+    page1_html: str | None = None
     page = 1
     while True:
         if not unlimited and len(ordered) >= max_branches:
@@ -100,6 +141,9 @@ async def search_branches(
             )
             break
 
+        # 2GIS search pages:
+        # - page 1: /{city}/search/{query}
+        # - page N: /{city}/search/{query}/page/{N}/
         search_url = (
             f"{SITE_BASE}/{city}/search/{safe_query}"
             if page == 1
@@ -126,6 +170,9 @@ async def search_branches(
                 logger.error("Search HTTP %d: %s", res.status_code, res.text[:200])
             break
 
+        if page == 1:
+            page1_html = res.text
+
         before = len(ordered)
         for m in re.finditer(r"/firm/(\d+)", res.text):
             fid = int(m.group(1))
@@ -140,6 +187,64 @@ async def search_branches(
             break
 
         page += 1
+
+    return page1_html
+
+
+async def search_branches(
+    client: httpx.AsyncClient, query: str, city: str, max_branches: int, *, deep: bool = False
+) -> list[dict]:
+    """
+    Ищет филиалы по текстовому запросу через HTML страницы поиска 2ГИС.
+
+    ХРУПКИЙ КОМПОНЕНТ: зависит от разметки 2ГИС. Если поиск вернет 0, см. README —
+    скорее всего 2ГИС поменял рендеринг или страница требует JS-гидрации.
+
+    Единственная зацепка — регулярка на паттерн `/firm/<digits>` в HTML.
+    Дубли убираются, порядок первого появления сохраняется (соответствует выдаче).
+
+    deep=True: 2ГИС отдаёт максимум ~60 фирм на запрос (5 страниц × 12), хотя реальных
+    совпадений бывает больше (см. `"total"`). Чтобы добрать остаток БЕЗ API-ключа,
+    после базового запроса шлём уточняющие под-запросы "{query} {рубрика}" по фасетам
+    рубрик, которые 2ГИС сам отдаёт на странице поиска, и объединяем результаты.
+    Это best-effort: рубрика, где >60 фирм, всё равно упрётся в лимит; полнота не
+    гарантирована, но покрытие сильно выше базовых 60. Стоит лишних запросов к 2ГИС.
+    """
+    seen: set[int] = set()
+    ordered: list[int] = []
+
+    # max_branches <= 0 → "без лимита": собираем всё, что 2ГИС отдаёт по запросу,
+    # пока не закончится пагинация (404/410). page-бэкстоп страхует от зацикливания.
+    unlimited = max_branches <= 0
+    page_cap = settings.search_max_pages_hard_cap
+
+    page1_html = await _collect_query_firm_ids(
+        client, query, city,
+        seen=seen, ordered=ordered, max_branches=max_branches,
+        unlimited=unlimited, page_cap=page_cap,
+    )
+
+    # Deep: добираем остаток уточняющими под-запросами по рубрикам-фасетам.
+    # Имеет смысл только если хотим больше, чем уже набрали (unlimited или лимит не выбран).
+    if deep and page1_html and (unlimited or len(ordered) < max_branches):
+        total = _parse_search_total(page1_html)
+        rubrics = _parse_rubric_facets(page1_html, settings.deep_search_max_rubrics)
+        if rubrics:
+            logger.info(
+                "Deep search city=%s query=%r: base=%d, total≈%s, expanding via %d rubric(s)",
+                city, query, len(ordered), total, len(rubrics),
+            )
+        for rub in rubrics:
+            if not unlimited and len(ordered) >= max_branches:
+                break
+            # total известен и уже добрали всё — нет смысла слать ещё запросы.
+            if total is not None and len(ordered) >= total:
+                break
+            await _collect_query_firm_ids(
+                client, f"{query} {rub}", city,
+                seen=seen, ordered=ordered, max_branches=max_branches,
+                unlimited=unlimited, page_cap=page_cap,
+            )
 
     if not unlimited:
         ordered = ordered[:max_branches]
