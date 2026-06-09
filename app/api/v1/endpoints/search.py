@@ -51,15 +51,20 @@ async def search_preview(payload: PreviewRequest):
     all_cities = payload.city == cities.ALL_CITIES
     target_cities = await cities.list_city_slugs() if all_cities else [payload.city]
 
+    # max_results=0 (без лимита) — это явное «дай всё»: включаем deep-добор
+    # автоматически, иначе 2ГИС обрежет выдачу до ~60 на запрос.
+    effective_deep = payload.deep_search or payload.max_results == 0
+
     async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
         async def _search_twogis():
             if payload.source not in ("2gis", "all"):
                 return []
             try:
                 if not all_cities:
+                    bbox = await cities.get_city_bbox(payload.city) if effective_deep else None
                     return await scraper.search_branches(
                         client, payload.query, payload.city, payload.max_results,
-                        deep=payload.deep_search,
+                        deep=effective_deep, bbox=bbox,
                     )
                 # city="all": ищем в каждом городе, но с ограничением параллелизма,
                 # иначе 2ГИС троттлит весь залп. Затем round-robin до max_results.
@@ -81,9 +86,10 @@ async def search_preview(payload: PreviewRequest):
 
                 async def _one_city(c: str):
                     async with city_sem:
+                        bbox = await cities.get_city_bbox(c) if effective_deep else None
                         return await scraper.search_branches(
                             client, payload.query, c, per_city_limit,
-                            deep=payload.deep_search,
+                            deep=effective_deep, bbox=bbox,
                         )
 
                 per_city = await asyncio.gather(*(_one_city(c) for c in target_cities))

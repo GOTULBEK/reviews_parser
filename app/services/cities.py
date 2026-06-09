@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -9,6 +10,29 @@ import httpx
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Тип bbox города: (min_lon, min_lat, max_lon, max_lat) в WGS84.
+BBox = tuple[float, float, float, float]
+
+
+def _bbox_from_wkt(wkt: str | None) -> BBox | None:
+    """Считает охватывающий прямоугольник из WKT-полигона границ города 2ГИС.
+
+    2ГИС отдаёт `bounds` как `POLYGON((lon lat, lon lat, ...))`. Нам не нужен сам
+    полигон — только bbox, чтобы разложить по городу сетку центров карты для
+    geo-sweep поиска (обход лимита ~60 фирм на запрос). Чётные числа — долготы,
+    нечётные — широты.
+    """
+    if not wkt:
+        return None
+    nums = re.findall(r"-?\d+\.\d+", wkt)
+    if len(nums) < 4:
+        return None
+    lons = [float(n) for n in nums[0::2]]
+    lats = [float(n) for n in nums[1::2]]
+    if not lons or not lats:
+        return None
+    return (min(lons), min(lats), max(lons), max(lats))
 
 # ---------------------------------------------------------------------------
 # Каталог городов Казахстана из 2ГИС.
@@ -78,6 +102,7 @@ def _static_catalog() -> list[dict]:
             "slug": _SLUG_BY_REGION_ID[rid],
             "name": _STATIC_NAMES[rid],
             "branch_count": None,
+            "bbox": None,
         }
         for rid in _SLUG_BY_REGION_ID
     ]
@@ -101,7 +126,8 @@ async def _fetch_live_catalog() -> list[dict]:
         "key": settings.twogis_web_api_key,
         "country_code_filter": "kz",
         "page_size": 300,
-        "fields": "items.statistics",
+        # items.bounds — WKT-полигон границ города; из него берём bbox для geo-sweep.
+        "fields": "items.statistics,items.bounds",
     }
     headers = {
         "User-Agent": settings.user_agent,
@@ -134,6 +160,7 @@ async def _fetch_live_catalog() -> list[dict]:
             "slug": slug,
             "name": it.get("name") or _STATIC_NAMES.get(rid),
             "branch_count": (it.get("statistics") or {}).get("branch_count"),
+            "bbox": _bbox_from_wkt(it.get("bounds")),
         })
 
     if not out:
@@ -174,6 +201,19 @@ async def get_cities(force_refresh: bool = False) -> list[dict]:
 async def list_city_slugs() -> list[str]:
     """Список URL-slug-ов всех городов Казахстана."""
     return [c["slug"] for c in await get_cities()]
+
+
+async def get_city_bbox(slug: str) -> BBox | None:
+    """bbox (min_lon, min_lat, max_lon, max_lat) города или None, если неизвестен.
+
+    Нужен для geo-sweep поиска: раскладываем по bbox сетку центров карты, чтобы
+    обойти лимит 2ГИС ~60 фирм на текстовый запрос. None → sweep недоступен,
+    поиск откатывается к рубричному добору.
+    """
+    for c in await get_cities():
+        if c["slug"] == slug:
+            return c.get("bbox")
+    return None
 
 
 async def is_valid_city(slug: str) -> bool:

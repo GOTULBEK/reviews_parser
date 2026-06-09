@@ -122,17 +122,35 @@ async def _collect_query_firm_ids(
     max_branches: int,
     unlimited: bool,
     page_cap: int,
+    map_center: tuple[float, float] | None = None,
+    max_pages: int | None = None,
 ) -> str | None:
     """Пагинирует один текстовый запрос, добавляя НОВЫЕ firm-id в seen/ordered.
 
     Возвращает HTML первой страницы (для разбора фасетов/total) или None.
     seen/ordered — общие на серию запросов, поэтому дедуп работает между ними.
+
+    map_center=(lon, lat): сдвигает вьюпорт карты (`?m=lon,lat/zoom`). 2ГИС ранжирует
+    выдачу относительно вьюпорта, поэтому из разных центров приходят разные топ-60 —
+    так geo-sweep обходит лимит ~60 фирм на запрос.
+
+    ВАЖНО: условие останова — по ЛОКАЛЬНОЙ выдаче этого запроса (а не по общему
+    ordered). Иначе center, чья 1-я страница уже целиком в seen, оборвётся сразу и
+    не дойдёт до своих уникальных фирм, лежащих на глубоких страницах вьюпорта.
     """
     safe_query = quote(query, safe="")
+    suffix = (
+        f"?m={map_center[0]}%2C{map_center[1]}%2F{settings.deep_search_zoom}"
+        if map_center is not None
+        else ""
+    )
     page1_html: str | None = None
+    local_seen: set[int] = set()
     page = 1
     while True:
         if not unlimited and len(ordered) >= max_branches:
+            break
+        if max_pages is not None and page > max_pages:
             break
         if page > page_cap:
             logger.warning(
@@ -148,7 +166,7 @@ async def _collect_query_firm_ids(
             f"{SITE_BASE}/{city}/search/{safe_query}"
             if page == 1
             else f"{SITE_BASE}/{city}/search/{safe_query}/page/{page}/"
-        )
+        ) + suffix
 
         logger.info("Search request: %s", search_url)
 
@@ -173,17 +191,18 @@ async def _collect_query_firm_ids(
         if page == 1:
             page1_html = res.text
 
-        before = len(ordered)
+        before_local = len(local_seen)
         for m in re.finditer(r"/firm/(\d+)", res.text):
             fid = int(m.group(1))
+            local_seen.add(fid)
             if fid not in seen:
                 seen.add(fid)
                 ordered.append(fid)
                 if not unlimited and len(ordered) >= max_branches:
                     break
 
-        # Stop when page is empty (no new firm IDs).
-        if len(ordered) == before:
+        # Stop when THIS query/viewport yields no new firm IDs of its own.
+        if len(local_seen) == before_local:
             break
 
         page += 1
@@ -191,8 +210,36 @@ async def _collect_query_firm_ids(
     return page1_html
 
 
+def _sweep_centers(bbox: tuple[float, float, float, float], grid: int) -> list[tuple[float, float]]:
+    """Раскладывает по bbox города сетку grid×grid центров карты для geo-sweep.
+
+    Точки берём в центрах ячеек (отступ от краёв), по убыванию близости к центру
+    города — центральные вьюпорты плотнее по фирмам, поэтому добор оттуда полезнее
+    и срабатывает раньше при early-stop по total.
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    if grid < 1:
+        grid = 1
+    mid_lon = (min_lon + max_lon) / 2
+    mid_lat = (min_lat + max_lat) / 2
+    pts: list[tuple[float, float]] = []
+    for i in range(grid):
+        for j in range(grid):
+            lon = round(min_lon + (i + 0.5) / grid * (max_lon - min_lon), 6)
+            lat = round(min_lat + (j + 0.5) / grid * (max_lat - min_lat), 6)
+            pts.append((lon, lat))
+    pts.sort(key=lambda p: (p[0] - mid_lon) ** 2 + (p[1] - mid_lat) ** 2)
+    return pts
+
+
 async def search_branches(
-    client: httpx.AsyncClient, query: str, city: str, max_branches: int, *, deep: bool = False
+    client: httpx.AsyncClient,
+    query: str,
+    city: str,
+    max_branches: int,
+    *,
+    deep: bool = False,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> list[dict]:
     """
     Ищет филиалы по текстовому запросу через HTML страницы поиска 2ГИС.
@@ -204,11 +251,13 @@ async def search_branches(
     Дубли убираются, порядок первого появления сохраняется (соответствует выдаче).
 
     deep=True: 2ГИС отдаёт максимум ~60 фирм на запрос (5 страниц × 12), хотя реальных
-    совпадений бывает больше (см. `"total"`). Чтобы добрать остаток БЕЗ API-ключа,
-    после базового запроса шлём уточняющие под-запросы "{query} {рубрика}" по фасетам
-    рубрик, которые 2ГИС сам отдаёт на странице поиска, и объединяем результаты.
-    Это best-effort: рубрика, где >60 фирм, всё равно упрётся в лимит; полнота не
-    гарантирована, но покрытие сильно выше базовых 60. Стоит лишних запросов к 2ГИС.
+    совпадений бывает больше (см. `"total"`). Чтобы добрать остаток БЕЗ API-ключа:
+      • geo-sweep (если известен bbox города): повторяем запрос из сетки центров карты
+        (`?m=lon,lat/zoom`) — у каждого вьюпорта свой топ-60, объединение покрывает весь
+        набор. Это основной механизм, обычно добирает до реального total.
+      • рубричный добор (фолбэк, если bbox нет): под-запросы "{query} {рубрика}" по
+        фасетам рубрик со страницы поиска.
+    Полнота best-effort, но покрытие сильно выше базовых 60. Стоит лишних запросов к 2ГИС.
     """
     seen: set[int] = set()
     ordered: list[int] = []
@@ -224,27 +273,60 @@ async def search_branches(
         unlimited=unlimited, page_cap=page_cap,
     )
 
-    # Deep: добираем остаток уточняющими под-запросами по рубрикам-фасетам.
-    # Имеет смысл только если хотим больше, чем уже набрали (unlimited или лимит не выбран).
+    # Deep: добираем остаток сверх базовых ~60. Имеет смысл, только если хотим больше,
+    # чем уже набрали (unlimited или лимит ещё не выбран).
     if deep and page1_html and (unlimited or len(ordered) < max_branches):
         total = _parse_search_total(page1_html)
-        rubrics = _parse_rubric_facets(page1_html, settings.deep_search_max_rubrics)
-        if rubrics:
-            logger.info(
-                "Deep search city=%s query=%r: base=%d, total≈%s, expanding via %d rubric(s)",
-                city, query, len(ordered), total, len(rubrics),
-            )
-        for rub in rubrics:
+
+        def _need_more() -> bool:
             if not unlimited and len(ordered) >= max_branches:
-                break
+                return False
             # total известен и уже добрали всё — нет смысла слать ещё запросы.
             if total is not None and len(ordered) >= total:
-                break
-            await _collect_query_firm_ids(
-                client, f"{query} {rub}", city,
-                seen=seen, ordered=ordered, max_branches=max_branches,
-                unlimited=unlimited, page_cap=page_cap,
+                return False
+            return True
+
+        # --- Шаг 1: geo-sweep по сетке центров карты (основной механизм). ---
+        if bbox is not None and _need_more():
+            centers = _sweep_centers(bbox, settings.deep_search_grid)
+            logger.info(
+                "Deep geo-sweep city=%s query=%r: base=%d, total≈%s, %d center(s)",
+                city, query, len(ordered), total, len(centers),
             )
+            sem = asyncio.Semaphore(settings.deep_search_concurrency)
+
+            async def _one_center(ctr: tuple[float, float]) -> None:
+                if not _need_more():
+                    return
+                async with sem:
+                    if not _need_more():
+                        return
+                    await _collect_query_firm_ids(
+                        client, query, city,
+                        seen=seen, ordered=ordered, max_branches=max_branches,
+                        unlimited=unlimited, page_cap=page_cap,
+                        map_center=ctr, max_pages=settings.deep_search_center_pages,
+                    )
+
+            await asyncio.gather(*(_one_center(c) for c in centers))
+
+        # --- Шаг 2: рубричный добор. Дополняет sweep (рубрики ловят фирмы, которые
+        # geo-выдача оставила за топом вьюпортов), а при отсутствии bbox — заменяет его.
+        if _need_more():
+            rubrics = _parse_rubric_facets(page1_html, settings.deep_search_max_rubrics)
+            if rubrics:
+                logger.info(
+                    "Deep rubric top-up city=%s query=%r: have=%d, total≈%s, %d rubric(s)",
+                    city, query, len(ordered), total, len(rubrics),
+                )
+            for rub in rubrics:
+                if not _need_more():
+                    break
+                await _collect_query_firm_ids(
+                    client, f"{query} {rub}", city,
+                    seen=seen, ordered=ordered, max_branches=max_branches,
+                    unlimited=unlimited, page_cap=page_cap,
+                )
 
     if not unlimited:
         ordered = ordered[:max_branches]

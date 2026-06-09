@@ -254,6 +254,8 @@ class TopicTimeSeries(BaseModel):
 class MonthlyAvgRatingPoint(BaseModel):
     month: str
     avg_rating: float | None = None
+    # Кол-во отзывов с датой в этом месяце (для сверки графика с итогами).
+    reviews: int = 0
 
 
 class TopicsModuleResponse(BaseModel):
@@ -269,6 +271,13 @@ class TopicsModuleResponse(BaseModel):
     fastest_growing_negative: TopicTrend | None = None
     strongest_positive: TopicTrend | None = None
     monthly_avg_rating: list[MonthlyAvgRatingPoint] = []
+    # Год, за который построен monthly_avg_rating (Янв..Дек). None — нет датированных отзывов.
+    selected_year: int | None = None
+    # Все годы, за которые есть датированные отзывы (для выпадающего списка на фронте).
+    available_years: list[int] = []
+    # Сумма отзывов с датой за выбранный год — сходится с sum(monthly_avg_rating[].reviews).
+    # Отличается от reviews_total (весь корпус за всё время) — это разные метрики.
+    monthly_reviews_total: int = 0
     topic_timeseries: list[TopicTimeSeries] = []
     analytics_note: str | None = None
 
@@ -297,6 +306,7 @@ class ReplyQueueItem(BaseModel):
     priority: ReplyPriority
     overdue_sla: bool
     age_hours: float | None = None
+    suggested_reply: str | None = None  # AI-suggested reply (top of queue only)
 
 
 class ReplyTemplate(BaseModel):

@@ -1169,3 +1169,115 @@ async def generate_reply_templates(
     except Exception:
         logger.exception("Claude API failed during reply templates generation")
         return []
+
+
+async def generate_review_replies(reviews: list[dict]) -> dict[str, str]:
+    """Generate a tailored public reply for each specific review, in one Claude call.
+
+    `reviews` — list of dicts with keys: id (str), text, rating, branch_name,
+    user_name. Returns a mapping {review_id: reply_text}. Replies are written in
+    the review's own language (Russian for the 2GIS corpus), addressing the
+    concrete complaint/praise of that exact review — unlike generate_reply_templates,
+    which produces generic, theme-level boilerplate.
+    """
+    if not client:
+        logger.warning("Anthropic API key missing. Returning no review replies.")
+        return {}
+
+    items_ctx = []
+    for r in reviews:
+        text = (r.get("text") or "").strip()
+        if not text:
+            continue
+        items_ctx.append(
+            {
+                "id": str(r.get("id")),
+                "rating": r.get("rating"),
+                "branch_name": r.get("branch_name"),
+                "user_name": r.get("user_name"),
+                "text": text[:2000],
+            }
+        )
+    if not items_ctx:
+        return {}
+
+    tool_schema = {
+        "name": "suggest_review_replies",
+        "description": (
+            "For each provided customer review, write one ready-to-publish public "
+            "reply on behalf of the business. Address the concrete issue or praise "
+            "in that exact review."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "The review id, copied verbatim from the input.",
+                            },
+                            "reply": {
+                                "type": "string",
+                                "description": (
+                                    "Public reply in the same language as the review "
+                                    "(Russian here), 2-4 sentences, polite, accountable, "
+                                    "specific to this review. Greet the author by name if "
+                                    "provided. No emoji, no placeholders like {name}."
+                                ),
+                            },
+                        },
+                        "required": ["id", "reply"],
+                    },
+                }
+            },
+            "required": ["items"],
+        },
+    }
+
+    try:
+        response = await _call_anthropic(
+            model=settings.claude_model,
+            max_tokens=2000,
+            temperature=0.4,
+            system=(
+                "You write public replies for a Russian-speaking customer-service team "
+                "responding to 2GIS reviews. For each review, acknowledge the specific "
+                "experience, apologize and offer a concrete next step for negatives, thank "
+                "warmly for positives. Tone: polite, professional, accountable, human — not "
+                "robotic. Reply in the review's language. No emoji. No placeholders. "
+                "Always return the exact id you were given for each review."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Write a reply for each of these reviews (JSON):\n"
+                        + json.dumps(items_ctx, ensure_ascii=False)
+                    ),
+                }
+            ],
+            tools=[tool_schema],
+            tool_choice={"type": "tool", "name": "suggest_review_replies"},
+        )
+
+        data = _extract_tool_input(response)
+        if not data:
+            return {}
+
+        out: dict[str, str] = {}
+        for raw in _coerce_dict_list(data.get("items")):
+            if not isinstance(raw, dict):
+                continue
+            rid = raw.get("id")
+            reply = raw.get("reply")
+            if isinstance(rid, str) and isinstance(reply, str) and reply.strip():
+                out[rid] = reply.strip()
+        return out
+
+    except Exception:
+        logger.exception("Claude API failed during review replies generation")
+        return {}

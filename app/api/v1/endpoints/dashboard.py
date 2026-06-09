@@ -139,14 +139,37 @@ def _topic_keywords(label: str) -> list[str]:
     return kws if kws else ([words[0]] if words else [label.lower()])
 
 
-async def _compute_topic_timeseries(
+def _topic_stems(label: str) -> list[str]:
+    """Стеммы ключевых слов темы для подстрочного матчинга по тексту отзыва.
+
+    Берём 6-символьный префикс (или слово целиком, если короче) — этого хватает,
+    чтобы поймать падежи/формы: «обслуживание/обслуживания/обслужили» → «обслуж»,
+    «доступность/доступно/недоступ» → «доступ». Достаточно совпадения ЛЮБОГО стемма.
+    """
+    return [w if len(w) <= 6 else w[:6] for w in _topic_keywords(label)]
+
+
+async def _compute_topic_quant(
     task_id: UUID,
-    topic_bars: list,
+    labels: list[str],
     session: AsyncSession,
     source: str,
-    city: str | None = None,
-) -> list[dict]:
-    """Single DB fetch → keyword matching per topic → monthly pos/neg counts."""
+    city: str | None,
+    year: int | None,
+) -> tuple[list[dict], list[dict]]:
+    """ЕДИНЫЙ источник правды для topic_bars и topic_timeseries.
+
+    Один проход по отзывам выбранного года → для каждой темы помесячная разбивка
+    pos/neg, а bar = сумма этих же помесячных значений. Поэтому
+    `Σ monthly[].positive == bar.positive` и `… negative` ВСЕГДА (by construction).
+    Ось — фиксированные 12 месяцев года (`YYYY-01..YYYY-12`), пустые = 0/0 — как
+    в monthly_avg_rating. Матчинг отзыва к теме — по стеммам слов лейбла (детерм.).
+
+    Возвращает (bars, timeseries). Если нет года/лейблов — ([], []).
+    """
+    if year is None or not labels:
+        return [], []
+
     rows = (
         await session.execute(
             text("""
@@ -163,46 +186,54 @@ async def _compute_topic_timeseries(
                   AND r.text != ''
                   AND (:source IS NULL OR b.source = :source)
                   AND (:city IS NULL OR b.city = :city)
-                  AND r.date_created >= (now() - interval '12 months')
+                  AND EXTRACT(YEAR FROM date_trunc('month', timezone(:tz, r.date_created))) = :year
             """).bindparams(
                 bindparam("tz", type_=sa.String()),
                 bindparam("source", type_=sa.String()),
                 bindparam("city", type_=sa.String()),
+                bindparam("year", type_=sa.Integer()),
             ),
             {
                 "task_id": task_id,
                 "tz": _OVERVIEW_TZ,
                 "source": source if source and source != "all" else None,
                 "city": city if city and city != "all" else None,
+                "year": year,
             },
         )
     ).all()
 
-    result = []
-    for bar in topic_bars:
-        kws = _topic_keywords(bar.label if hasattr(bar, "label") else bar["label"])
-        monthly: dict[str, dict[str, int]] = {}
-        for row in rows:
-            if not any(kw in (row.text or "") for kw in kws):
+    months = [f"{year}-{mm:02d}" for mm in range(1, 13)]
+    # Предкомпилируем стеммы и (текст, месяц, оценка) один раз.
+    stems_by_label = {label: _topic_stems(label) for label in labels}
+    docs = [(r.text or "", r.month, r.rating) for r in rows]
+
+    bars: list[dict] = []
+    series: list[dict] = []
+    for label in labels:
+        stems = stems_by_label[label]
+        bucket = {m: {"positive": 0, "negative": 0} for m in months}
+        pos_total = neg_total = 0
+        for text_l, month, rating in docs:
+            if rating is None or month not in bucket:
                 continue
-            m = row.month
-            if m not in monthly:
-                monthly[m] = {"positive": 0, "negative": 0}
-            if row.rating is not None:
-                if row.rating >= 4:
-                    monthly[m]["positive"] += 1
-                elif row.rating <= 2:
-                    monthly[m]["negative"] += 1
-        result.append(
-            {
-                "label": bar.label if hasattr(bar, "label") else bar["label"],
-                "monthly": [
-                    {"month": m, "positive": v["positive"], "negative": v["negative"]}
-                    for m, v in sorted(monthly.items())
-                ],
-            }
-        )
-    return result
+            if not any(s in text_l for s in stems):
+                continue
+            if rating >= 4:
+                bucket[month]["positive"] += 1
+                pos_total += 1
+            elif rating <= 2:
+                bucket[month]["negative"] += 1
+                neg_total += 1
+        bars.append({"label": label, "positive": pos_total, "negative": neg_total})
+        series.append({
+            "label": label,
+            "monthly": [
+                {"month": m, "positive": bucket[m]["positive"], "negative": bucket[m]["negative"]}
+                for m in months
+            ],
+        })
+    return bars, series
 
 
 def _run_topic_extraction(docs):
@@ -1489,6 +1520,12 @@ async def get_task_topics_module(
     ),
     source: Literal["2gis", "zapis", "all"] = Query("2gis", description="Filter by data source"),
     city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
+    year: int | None = Query(
+        None,
+        ge=2000,
+        le=2100,
+        description="Год для графика monthly_avg_rating (Янв..Дек). По умолчанию — последний год с отзывами.",
+    ),
     session: AsyncSession = Depends(get_session),
 ):
     task = await _require_task(task_id, session)
@@ -1517,21 +1554,66 @@ async def get_task_topics_module(
     count_stmt = _apply_branch_filters(count_stmt, source, city)
     reviews_total = int((await session.execute(count_stmt)).scalar_one() or 0)
 
-    # Monthly average rating (always computed, never via Claude). Last 12 months in TZ.
-    monthly_stmt = await session.execute(
+    # Monthly average rating (always computed, never via Claude). Год = 12 месяцев Янв..Дек.
+    #
+    # РАНЬШЕ: жёстко «последние 12 месяцев». Для филиалов с историей с 2018 это
+    # показывало ~15% отзывов и не билось с reviews_total. ТЕПЕРЬ: выбор года.
+    # Считаем годы с датированными отзывами (для фильтра), берём выбранный (или
+    # последний по умолчанию) и строим Янв..Дек этого года с avg_rating И числом
+    # отзывов помесячно — так график сходится сам с собой (sum(reviews)=за год).
+    src_param = source if source and source != "all" else None
+    city_param = city if city and city != "all" else None
+    common_params = {"task_id": task_id, "tz": _OVERVIEW_TZ, "source": src_param, "city": city_param}
+    _year_binds = [
+        bindparam("tz", type_=sa.String()),
+        bindparam("source", type_=sa.String()),
+        bindparam("city", type_=sa.String()),
+    ]
+
+    years_rows = (await session.execute(
         text(
             """
+SELECT DISTINCT EXTRACT(YEAR FROM date_trunc('month', timezone(:tz, r.date_created)))::int AS yr
+FROM reviews r
+JOIN search_task_branches stb ON stb.branch_id = r.branch_id
+JOIN branches b ON b.id = r.branch_id
+WHERE stb.task_id = :task_id
+  AND r.date_created IS NOT NULL
+  AND (:source IS NULL OR b.source = :source)
+  AND (:city IS NULL OR b.city = :city)
+ORDER BY yr
+"""
+        ).bindparams(*_year_binds),
+        common_params,
+    )).all()
+    available_years = [int(r.yr) for r in years_rows]
+
+    # Выбранный год: запрошенный (если есть данные) → иначе последний год с отзывами.
+    if year is not None and year in available_years:
+        selected_year = year
+    elif available_years:
+        selected_year = max(available_years)
+    else:
+        selected_year = None
+
+    monthly_avg_rating: list[MonthlyAvgRatingPoint] = []
+    monthly_reviews_total = 0
+    if selected_year is not None:
+        monthly_stmt = await session.execute(
+            text(
+                """
 WITH months AS (
   SELECT generate_series(
-    date_trunc('month', timezone(:tz, now())) - interval '11 months',
-    date_trunc('month', timezone(:tz, now())),
+    make_date(:year, 1, 1)::timestamp,
+    make_date(:year, 12, 1)::timestamp,
     interval '1 month'
   ) AS month_start
 ),
 agg AS (
   SELECT
     date_trunc('month', timezone(:tz, r.date_created)) AS month_start,
-    avg(r.rating) FILTER (WHERE r.rating IS NOT NULL) AS avg_rating
+    avg(r.rating) FILTER (WHERE r.rating IS NOT NULL) AS avg_rating,
+    count(*) AS n
   FROM reviews r
   JOIN search_task_branches stb ON stb.branch_id = r.branch_id
   JOIN branches b ON b.id = r.branch_id
@@ -1543,47 +1625,50 @@ agg AS (
 )
 SELECT
   to_char(m.month_start, 'YYYY-MM') AS month,
-  a.avg_rating
+  a.avg_rating,
+  COALESCE(a.n, 0) AS n
 FROM months m
 LEFT JOIN agg a USING (month_start)
 ORDER BY m.month_start ASC
 """
-        ).bindparams(
-            bindparam("tz", type_=sa.String()),
-            bindparam("source", type_=sa.String()),
-            bindparam("city", type_=sa.String()),
-        ),
-        {
-            "task_id": task_id, "tz": _OVERVIEW_TZ,
-            "source": source if source and source != "all" else None,
-            "city": city if city and city != "all" else None,
-        },
-    )
-    monthly_avg_rating = [
-        MonthlyAvgRatingPoint(
-            month=str(r.month),
-            avg_rating=round(float(r.avg_rating), 2) if r.avg_rating is not None else None,
+            ).bindparams(*_year_binds, bindparam("year", type_=sa.Integer())),
+            {**common_params, "year": selected_year},
         )
-        for r in monthly_stmt.all()
-    ]
+        for r in monthly_stmt.all():
+            n = int(r.n or 0)
+            monthly_reviews_total += n
+            monthly_avg_rating.append(MonthlyAvgRatingPoint(
+                month=str(r.month),
+                avg_rating=round(float(r.avg_rating), 2) if r.avg_rating is not None else None,
+                reviews=n,
+            ))
 
     if cached is not None:
-        topic_bars = [TopicBarItem(**t) for t in (cached.get("topic_bars") or [])]
-        top_positive = [TopicListItem(**t) for t in (cached.get("top_positive") or [])]
-        top_negative = [TopicListItem(**t) for t in (cached.get("top_negative") or [])]
+        # Лейблы тем (семантическая кластеризация) — от Claude. КОЛИЧЕСТВА (bars и
+        # timeseries) считаем ДЕТЕРМИНИРОВАННО из одних и тех же отзывов выбранного
+        # года, поэтому бар = сумма помесячного ряда (см. _compute_topic_quant) и
+        # «цифры бьются». Раньше бар брался из оценки Claude (весь корпус), а ряд —
+        # из отдельного keyword-матчинга за 12 мес → расхождение в 10–30 раз.
+        labels = [str(t.get("label")) for t in (cached.get("topic_bars") or []) if t.get("label")]
+        bars_raw, ts_raw = await _compute_topic_quant(task_id, labels, session, source, city, selected_year)
+        topic_bars = [TopicBarItem(**b) for b in bars_raw]
+        topic_timeseries = [TopicTimeSeries(**t) for t in ts_raw]
+        # top_positive / top_negative — те же темы, ранжированные по pos/neg за год
+        # (а не отдельный список Claude), чтобы и они сходились с барами.
+        top_positive = [
+            TopicListItem(label=b["label"], sentiment="pos", mentions=b["positive"])
+            for b in sorted(bars_raw, key=lambda x: x["positive"], reverse=True)
+            if b["positive"] > 0
+        ][:6]
+        top_negative = [
+            TopicListItem(label=b["label"], sentiment="neg", mentions=b["negative"])
+            for b in sorted(bars_raw, key=lambda x: x["negative"], reverse=True)
+            if b["negative"] > 0
+        ][:6]
+        # Качественные поля остаются от Claude.
         frequent_phrases = list(cached.get("frequent_phrases") or [])
         fgn = TopicTrend(**cached["fastest_growing_negative"]) if cached.get("fastest_growing_negative") else None
         sp = TopicTrend(**cached["strongest_positive"]) if cached.get("strongest_positive") else None
-        # Timeseries may be missing from older cache rows — compute and persist it on-demand.
-        _ts_raw = cached.get("topic_timeseries")
-        if _ts_raw is None and topic_bars:
-            _ts_raw = await _compute_topic_timeseries(task_id, topic_bars, session, "all", city)
-            try:
-                cache_row.topics_module = {**cached, "topic_timeseries": _ts_raw}
-                await session.commit()
-            except Exception:
-                await session.rollback()
-        topic_timeseries = [TopicTimeSeries(**t) for t in (_ts_raw or [])]
     else:
         # _ensure_full_analysis не смог посчитать (нет ключа/отзывов/сбой) — пусто.
         topic_bars, top_positive, top_negative = [], [], []
@@ -1607,8 +1692,14 @@ ORDER BY m.month_start ASC
         fastest_growing_negative=fgn,
         strongest_positive=sp,
         monthly_avg_rating=monthly_avg_rating,
+        selected_year=selected_year,
+        available_years=available_years,
+        monthly_reviews_total=monthly_reviews_total,
         topic_timeseries=topic_timeseries,
-        analytics_note=("Topics synthesized by Claude AI." if topic_bars else "Not enough data or AI unavailable."),
+        analytics_note=(
+            f"Темы — Claude AI; счётчики bars/ряда — по датам отзывов за {selected_year}."
+            if topic_bars else "Not enough data or AI unavailable."
+        ),
     )
 
 
@@ -1822,6 +1913,24 @@ async def get_task_replies_module(
             )
         )
 
+    # AI-suggested replies for the top of the queue (first 3 items only, one Claude call).
+    top_items = queue[:3]
+    if top_items:
+        suggestions = await claude_service.generate_review_replies(
+            [
+                {
+                    "id": str(item.id),
+                    "text": item.text,
+                    "rating": item.rating,
+                    "branch_name": item.branch_name,
+                    "user_name": item.user_name,
+                }
+                for item in top_items
+            ]
+        )
+        for item in top_items:
+            item.suggested_reply = suggestions.get(str(item.id))
+
     # Templates — Claude-generated and cached per (task_id, days).
     cache_stmt = _topics_cache_lookup(task_id, days, city)
     cache_row = (await session.execute(cache_stmt)).scalars().first()
@@ -1863,14 +1972,15 @@ from app.models.core import Company
     "/{task_id}/compare",
     response_model=CompareResponse,
     tags=["dashboard"],
-    summary="Сравнение клубов (Target vs Competitors)",
+    summary="Сравнение выбранных филиалов задачи",
 )
 async def get_compare(
     task_id: UUID,
     grouped: bool = Query(False, description="Если True, филиалы одной компании объединяются"),
-    city: str = Query("all", description="Filter by branch city slug (e.g. almaty); 'all' = auto-detect from task"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty); 'all' = все города задачи"),
     session: AsyncSession = Depends(get_session),
 ):
+    # Сравнение охватывает РОВНО филиалы задачи (без рыночных конкурентов).
     task = await _require_task(task_id, session)
 
     target_stmt = select(Branch).join(SearchTaskBranch).where(SearchTaskBranch.task_id == task_id)
@@ -1885,17 +1995,9 @@ async def get_compare(
     target_company_ids = {b.company_id for b in target_branches}
     target_branch_ids = {b.id for b in target_branches}
 
-    # Build the full set of categories we want to match against competitors.
-    # Priority: multi-category array, then single legacy category, then task query.
-    target_categories: list[str] = []
-    for b in target_branches:
-        if b.categories:
-            target_categories.extend(b.categories)
-        elif b.category:
-            target_categories.append(b.category)
-    target_categories = list(dict.fromkeys(target_categories))  # dedupe, preserve order
-
-    target_city = city if (city and city != "all") else next((b.city for b in target_branches if b.city), None)
+    # Сравниваемое множество — ровно выбранные филиалы (target_branch_ids уже сужен
+    # по городу, если city задан), поэтому фильтр по городу отдельно не нужен.
+    branch_scope = Branch.id.in_(target_branch_ids)
 
     if grouped:
         stmt = (
@@ -1912,16 +2014,7 @@ async def get_compare(
             .join(Branch, Branch.company_id == Company.id)
             .outerjoin(Review, Review.branch_id == Branch.id)
         )
-        if target_categories:
-            stmt = stmt.where(
-                or_(
-                    Branch.categories.overlap(target_categories),
-                    Branch.category.in_(target_categories),
-                    Branch.id.in_(target_branch_ids)
-                )
-            )
-        if target_city:
-            stmt = stmt.where(Branch.city == target_city)
+        stmt = stmt.where(branch_scope)
         stmt = stmt.group_by(Company.id, Company.name)
     else:
         stmt = (
@@ -1938,16 +2031,7 @@ async def get_compare(
             .join(Company, Company.id == Branch.company_id)
             .outerjoin(Review, Review.branch_id == Branch.id)
         )
-        if target_categories:
-            stmt = stmt.where(
-                or_(
-                    Branch.categories.overlap(target_categories),
-                    Branch.category.in_(target_categories),
-                    Branch.id.in_(target_branch_ids)
-                )
-            )
-        if target_city:
-            stmt = stmt.where(Branch.city == target_city)
+        stmt = stmt.where(branch_scope)
         stmt = stmt.group_by(Branch.id, Company.name)
 
     rows = (await session.execute(stmt)).all()
@@ -1957,17 +2041,8 @@ async def get_compare(
         cat_stmt = (
             select(Branch.company_id, Branch.categories)
             .where(Branch.categories.isnot(None))
+            .where(branch_scope)
         )
-        if target_categories:
-            cat_stmt = cat_stmt.where(
-                or_(
-                    Branch.categories.overlap(target_categories),
-                    Branch.category.in_(target_categories),
-                    Branch.id.in_(target_branch_ids),
-                )
-            )
-        if target_city:
-            cat_stmt = cat_stmt.where(Branch.city == target_city)
         for cid, cats in (await session.execute(cat_stmt)).all():
             if not cats:
                 continue
