@@ -13,7 +13,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.core.config import settings
-from app.services.cities import KZ_CITY_SLUGS
+from app.services.cities import KZ_CITY_SLUGS, normalize_city_slug
 
 logger = logging.getLogger(__name__)
 
@@ -499,8 +499,13 @@ def _extract_city_from_soup(soup: BeautifulSoup) -> str | None:
     """
     for a in soup.find_all("a", href=re.compile(r"^/[a-z-]+/(?:firm|geo)/\d+")):
         m = re.match(r"^/([a-z-]+)/(?:firm|geo)/\d+", a.get("href", ""))
-        if m and m.group(1) in KZ_CITY_SLUGS:
-            return m.group(1)
+        if not m:
+            continue
+        # 2ГИС использует иную транслитерацию для городов на «-й» (kostanaj/semej),
+        # приводим к каноническому slug каталога перед проверкой.
+        slug = normalize_city_slug(m.group(1))
+        if slug in KZ_CITY_SLUGS:
+            return slug
     return None
 
 

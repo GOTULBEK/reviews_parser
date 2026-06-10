@@ -228,3 +228,20 @@ ALL_CITIES = "all"
 
 # Все известные slug-и городов Казахстана (для валидации/извлечения из URL).
 KZ_CITY_SLUGS = set(_SLUG_BY_REGION_ID.values())
+
+# 2ГИС во ВНУТРЕННИХ ссылках firm/geo транслитерирует «-й» как «-j», тогда как
+# наш каталог-slug использует «-y». Это касается единственных двух городов из 19,
+# чьё имя кончается на «й»: Костанай и Семей. Без нормализации
+# `_extract_city_from_soup` не узнаёт город (slug нет в KZ_CITY_SLUGS) → city=NULL
+# → филиал выпадает из /cities и показывается как «all».
+_SLUG_ALIASES: dict[str, str] = {
+    "kostanaj": "kostanay",
+    "semej": "semey",
+}
+
+
+def normalize_city_slug(slug: str | None) -> str | None:
+    """Приводит slug из ссылок 2ГИС к каноническому slug каталога."""
+    if not slug:
+        return None
+    return _SLUG_ALIASES.get(slug, slug)
