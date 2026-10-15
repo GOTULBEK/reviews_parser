@@ -32,7 +32,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+# Origin сравнивается точной строкой, а браузер шлёт его без завершающего слэша —
+# срезаем, иначе "http://host:3000/" в CORS_ORIGINS молча ничего не разрешит.
+cors_origins = [o for o in (s.strip().rstrip("/") for s in settings.cors_origins.split(",")) if o]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
