@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 REVIEWS_API_BASE = "https://public-api.reviews.2gis.com/3.0"
 SITE_BASE = "https://2gis.kz"
+# Личный кабинет 2ГИС для бизнеса — там владелец отвечает на отзывы.
+ACCOUNT_BASE = "https://account.2gis.com"
 
 _HEADERS_JSON = {
     "User-Agent": settings.user_agent,
@@ -350,8 +352,8 @@ def _normalize_firm_url(firm_url: str) -> str:
     return re.split(r"[?#]", url)[0].rstrip("/")
 
 
-async def _fetch_firm_soup(client: httpx.AsyncClient, firm_url: str) -> BeautifulSoup | None:
-    """Загружает firm-страницу и парсит в BeautifulSoup. None при любой ошибке."""
+async def _fetch_firm_html(client: httpx.AsyncClient, firm_url: str) -> str | None:
+    """Загружает firm-страницу и отдаёт её HTML как есть. None при любой ошибке."""
     page_url = _normalize_firm_url(firm_url)
     res = await _get_with_retry(client, page_url, _HEADERS_HTML, attempts=2)
     if res is None:
@@ -362,7 +364,39 @@ async def _fetch_firm_soup(client: httpx.AsyncClient, firm_url: str) -> Beautifu
         logger.warning("Firm page HTTP %d: %s", res.status_code, page_url)
         return None
 
-    return BeautifulSoup(res.text, "html.parser")
+    return res.text
+
+
+async def _fetch_firm_soup(client: httpx.AsyncClient, firm_url: str) -> BeautifulSoup | None:
+    """Загружает firm-страницу и парсит в BeautifulSoup. None при любой ошибке."""
+    html = await _fetch_firm_html(client, firm_url)
+    return BeautifulSoup(html, "html.parser") if html is not None else None
+
+
+# Организация филиала в данных страницы: {"branch_count":…,"id":"<org>",…,"name":"…"}. Ищем её в объекте САМОГО
+# филиала (он начинается с "id":"<gis_branch_id>…"): на странице лежат и соседние фирмы, у каждой своя организация.
+_ORG_IN_OBJECT = re.compile(r'"org":\{[^{}]*?"id":"(\d+)')
+
+
+def extract_org_id(html: str, gis_branch_id: int | str) -> int | None:
+    """id организации 2ГИС, к которой относится филиал, — из данных его firm-страницы. None, если не нашли.
+
+    Нужен для ссылки в личный кабинет: отзывы там живут по адресу /orgs/<организация>/reviews/<филиал>.
+    """
+    for m in re.finditer(r'"id":"%s(?:_[^"]*)?"' % re.escape(str(gis_branch_id)), html):
+        org = _ORG_IN_OBJECT.search(html, m.end(), m.end() + 8000)
+        if org:
+            try:
+                return int(org.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+async def fetch_org_id(client: httpx.AsyncClient, gis_branch_id: int, firm_url: str) -> int | None:
+    """Одна загрузка firm-страницы → id организации филиала (для дозаполнения уже собранных филиалов)."""
+    html = await _fetch_firm_html(client, firm_url)
+    return extract_org_id(html, gis_branch_id) if html is not None else None
 
 
 def _extract_address_from_soup(soup: BeautifulSoup) -> str:
@@ -509,13 +543,17 @@ def _extract_city_from_soup(soup: BeautifulSoup) -> str | None:
     return None
 
 
-async def scrape_branch_info(client: httpx.AsyncClient, firm_url: str) -> tuple[str | None, str | None, str, list[str], str | None]:
-    """Обертка для одной сетевой загрузки + извлечение имени, категорий, адреса, города."""
-    soup = await _fetch_firm_soup(client, firm_url)
-    if soup is None:
-        return None, None, "Адрес не найден", [], None
+async def scrape_branch_info(
+    client: httpx.AsyncClient, firm_url: str, gis_branch_id: int | None = None
+) -> tuple[str | None, str | None, str, list[str], str | None, int | None]:
+    """Обертка для одной сетевой загрузки + извлечение имени, категорий, адреса, города и организации."""
+    html = await _fetch_firm_html(client, firm_url)
+    if html is None:
+        return None, None, "Адрес не найден", [], None, None
+    soup = BeautifulSoup(html, "html.parser")
     name, category, categories = _extract_name_and_categories_from_soup(soup)
-    return name, category, _extract_address_from_soup(soup), categories, _extract_city_from_soup(soup)
+    org_id = extract_org_id(html, gis_branch_id) if gis_branch_id is not None else None
+    return name, category, _extract_address_from_soup(soup), categories, _extract_city_from_soup(soup), org_id
 
 
 async def scrape_branch_preview(
@@ -620,6 +658,15 @@ def build_review_url(gis_branch_id: int, gis_review_id: str) -> str:
     return f"{SITE_BASE}/reviews/{gis_branch_id}/review/{gis_review_id}"
 
 
+def build_owner_review_url(gis_org_id: int, gis_branch_id: int, gis_review_id: str) -> str:
+    """Тот же отзыв в личном кабинете 2ГИС для бизнеса — там владелец на него отвечает.
+
+    Адрес — тот, что строит сам кабинет: /orgs/<организация>/reviews/<филиал>?reviewId=<отзыв>. Открывается у того,
+    кто вошёл в кабинет и управляет этой организацией; у остальных — вход в кабинет.
+    """
+    return f"{ACCOUNT_BASE}/orgs/{gis_org_id}/reviews/{gis_branch_id}?reviewId={gis_review_id}"
+
+
 # ---------------------------------------------------------------------------
 # Step 4 — aggregate scrape of one branch
 # ---------------------------------------------------------------------------
@@ -629,8 +676,8 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
     Скрапит адрес + распределение рейтинга + все отзывы одного филиала.
     Возвращает словарь, готовый для upsert в БД.
     """
-    (name, category, address, categories, city), distribution = await asyncio.gather(
-        scrape_branch_info(client, firm_url),
+    (name, category, address, categories, city, org_id), distribution = await asyncio.gather(
+        scrape_branch_info(client, firm_url, gis_branch_id),
         fetch_rating_distribution(client, gis_branch_id),
     )
 
@@ -706,5 +753,6 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
         "rating_distribution": distribution,
         "url": firm_url,
         "city": city,
+        "gis_org_id": org_id,
         "reviews": all_reviews,
     }

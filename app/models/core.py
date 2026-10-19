@@ -38,6 +38,9 @@ class Branch(Base):
     gis_branch_id: Mapped[int] = mapped_column(
         BigInteger, nullable=False, index=True
     )
+    # Организация 2ГИС, к которой относится филиал (из данных firm-страницы). Нужна для ссылки на отзыв в личном
+    # кабинете владельца: /orgs/<организация>/reviews/<филиал>. Пусто — не нашли или ещё не дозаполнили.
+    gis_org_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     source: Mapped[str] = mapped_column(String(64), nullable=False, server_default="2gis")
     company_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True

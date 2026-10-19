@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -107,11 +107,12 @@ async def _upsert_branch(session: AsyncSession, data: dict, company_id: UUID) ->
         "total_reviews": data.get("total_reviews"),
         "url": data["url"],
         "rating_distribution": data.get("rating_distribution"),
+        "gis_org_id": data.get("gis_org_id"),
         "scraped_at": now,
     }
+    ins = pg_insert(Branch).values(**values)
     stmt = (
-        pg_insert(Branch)
-        .values(**values)
+        ins
         .on_conflict_do_update(
             index_elements=["gis_branch_id", "source"],
             set_={
@@ -125,6 +126,8 @@ async def _upsert_branch(session: AsyncSession, data: dict, company_id: UUID) ->
                 "total_reviews": values["total_reviews"],
                 "url": values["url"],
                 "rating_distribution": values["rating_distribution"],
+                # Не затирать известную организацию пустой: firm-страница может не загрузиться в этот раз.
+                "gis_org_id": func.coalesce(ins.excluded.gis_org_id, Branch.gis_org_id),
                 "scraped_at": values["scraped_at"],
             },
         )

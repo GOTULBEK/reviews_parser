@@ -23,6 +23,7 @@ from app.api.v1.endpoints.tasks import _require_task
 from app.schemas.dashboard import TopicTimeSeries, TopicTimeSeriesPoint
 from app.schemas.cities import TaskCityItem, TaskCityListResponse
 from app.services import cities as cities_service
+from app.services import scraper
 
 router = APIRouter()
 
@@ -1873,7 +1874,13 @@ async def get_task_replies_module(
         order_cols = (rating_priority.asc(), Review.date_created.desc().nulls_last())
 
     queue_stmt = (
-        select(Review, Branch.name.label("branch_name"))
+        select(
+            Review,
+            Branch.name.label("branch_name"),
+            Branch.gis_branch_id,
+            Branch.gis_org_id,
+            Branch.source.label("branch_source"),
+        )
         .join(SearchTaskBranch, SearchTaskBranch.branch_id == Review.branch_id)
         .join(Branch, Branch.id == Review.branch_id)
         .where(and_(*base_filters))
@@ -1886,7 +1893,7 @@ async def get_task_replies_module(
     queue_rows = (await session.execute(queue_stmt)).all()
 
     queue: list[ReplyQueueItem] = []
-    for r, branch_name in queue_rows:
+    for r, branch_name, gis_branch_id, gis_org_id, branch_source in queue_rows:
         age_hours: float | None = None
         if r.date_created is not None:
             delta = now - r.date_created
@@ -1905,7 +1912,13 @@ async def get_task_replies_module(
                 rating=r.rating,
                 text=r.text,
                 date_created=r.date_created,
-                review_url=r.review_url,
+                # Очередь «Ответы» — для владельца: ссылка ведёт на отзыв в личном кабинете 2ГИС, где на него отвечают.
+                # Организация ещё не известна (или это не 2ГИС) — прежняя публичная страница отзыва.
+                review_url=(
+                    scraper.build_owner_review_url(gis_org_id, gis_branch_id, r.gis_review_id)
+                    if gis_org_id and branch_source == "2gis"
+                    else r.review_url
+                ),
                 sentiment=_sentiment_from_rating(r.rating),
                 priority=priority,
                 overdue_sla=overdue_sla,
