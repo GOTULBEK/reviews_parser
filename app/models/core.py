@@ -54,6 +54,10 @@ class Branch(Base):
     total_reviews: Mapped[int | None] = mapped_column(Integer)
     url: Mapped[str] = mapped_column(String(1024), nullable=False)
     rating_distribution: Mapped[dict | None] = mapped_column(JSONB)
+    # Телефоны с карточки источника, в её порядке: [{"number", "text", "comment"}].
+    # NULL — номера не собирались, [] — собирались, на карточке их нет.
+    phones: Mapped[list[dict] | None] = mapped_column(JSONB)
+    phones_scraped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scraped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

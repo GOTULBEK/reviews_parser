@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import Any
 import uuid
 
@@ -76,11 +77,58 @@ async def scrape_branch_preview(
         }
 
 
-async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: str, firm_url: str) -> dict:
+def _phones_from_firm(firm: dict) -> list[dict] | None:
+    """Телефоны карточки zapis.kz: `phoneNumbers` = ["+7 778 000 2354", …].
+
+    None — поля нет (ответ сменил форму), номера неизвестны. [] — номеров нет.
+    """
+    raw = firm.get("phoneNumbers")
+    if not isinstance(raw, list):
+        return None
+    phones: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = str(item or "").strip()
+        digits = re.sub(r"\D", "", text)
+        if not digits:
+            continue
+        number = ("+" if text.startswith("+") else "") + digits
+        if number in seen:
+            continue
+        seen.add(number)
+        phones.append({"number": number, "text": text, "comment": None})
+    return phones
+
+
+async def scrape_branch(
+    client: httpx.AsyncClient,
+    gis_branch_id: str,
+    firm_url: str,
+    *,
+    with_reviews: bool = True,
+    with_phones: bool = False,
+) -> dict:
+    """Карточка фирмы (+ телефоны при with_phones) и, при with_reviews, все отзывы.
+
+    Ключи словаря — как у scraper.scrape_branch.
+    """
     try:
         firm_res = await client.get(firm_url, headers=ZAPIS_HEADERS)
         firm_res.raise_for_status()
         firm_data = firm_res.json().get("data", {}).get("firm", {})
+
+        result: dict = {
+            "gis_branch_id": str(gis_branch_id),
+            "company_name": firm_data.get("name"),
+            "category": firm_data.get("category") or firm_data.get("type"),
+            "categories": [firm_data.get("category"), firm_data.get("type")] if firm_data.get("category") and firm_data.get("type") else [firm_data.get("category") or firm_data.get("type")],
+            "address": firm_data.get("address"),
+            "url": firm_url,
+        }
+        if with_phones:
+            result["phones"] = _phones_from_firm(firm_data)
+        if not with_reviews:
+            return result
 
         base_reviews_url = f"{SITE_BASE}/rest/clients-app/v1/firms/{gis_branch_id}/reviews"
         
@@ -136,18 +184,13 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: str, firm_url:
             if k in ["EXCELLENT", "GOOD", "BAD", "NORMAL"]
         }
         
-        return {
-            "gis_branch_id": str(gis_branch_id),
-            "company_name": firm_data.get("name"),
-            "category": firm_data.get("category") or firm_data.get("type"),
-            "categories": [firm_data.get("category"), firm_data.get("type")] if firm_data.get("category") and firm_data.get("type") else [firm_data.get("category") or firm_data.get("type")],
-            "address": firm_data.get("address"),
-            "rating": float(reviews_data_base.get("averageRating", 0.0) or 0.0),
-            "total_reviews": int(reviews_data_base.get("totalReviewsCount", 0) or 0),
-            "rating_distribution": dist,
-            "url": firm_url,
-            "reviews": all_reviews,
-        }
+        result.update(
+            rating=float(reviews_data_base.get("averageRating", 0.0) or 0.0),
+            total_reviews=int(reviews_data_base.get("totalReviewsCount", 0) or 0),
+            rating_distribution=dist,
+            reviews=all_reviews,
+        )
+        return result
     except Exception as e:
         logger.exception("zapis.kz scrape failed for %s: %s", gis_branch_id, e)
         raise

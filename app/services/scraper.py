@@ -543,17 +543,91 @@ def _extract_city_from_soup(soup: BeautifulSoup) -> str | None:
     return None
 
 
-async def scrape_branch_info(
-    client: httpx.AsyncClient, firm_url: str, gis_branch_id: int | None = None
-) -> tuple[str | None, str | None, str, list[str], str | None, int | None]:
-    """Обертка для одной сетевой загрузки + извлечение имени, категорий, адреса, города и организации."""
-    html = await _fetch_firm_html(client, firm_url)
+def _parse_firm_page(html: str | None) -> tuple[str | None, str | None, str, list[str], str | None]:
+    """Имя, категория, адрес, рубрики и город из HTML firm-страницы (None — не загрузилась)."""
     if html is None:
-        return None, None, "Адрес не найден", [], None, None
+        return None, None, "Адрес не найден", [], None
     soup = BeautifulSoup(html, "html.parser")
     name, category, categories = _extract_name_and_categories_from_soup(soup)
-    org_id = extract_org_id(html, gis_branch_id) if gis_branch_id is not None else None
-    return name, category, _extract_address_from_soup(soup), categories, _extract_city_from_soup(soup), org_id
+    return name, category, _extract_address_from_soup(soup), categories, _extract_city_from_soup(soup)
+
+
+# Состояние страницы фирмы: `var initialState = JSON.parse('…')` — JSON внутри
+# JS-строки в одинарных кавычках (тело — по «развёрнутому циклу», без возвратов).
+_INITIAL_STATE_RE = re.compile(r"var\s+initialState\s*=\s*JSON\.parse\('([^'\\]*(?:\\.[^'\\]*)*)'\)", re.S)
+_JS_ESCAPE_RE = re.compile(r"\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)", re.S)
+_JS_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+
+
+def _js_unescape(literal: str) -> str:
+    """Раскодирует тело JS-строки — то, что браузер делает до JSON.parse."""
+    def _one(m: re.Match) -> str:
+        esc = m.group(1)
+        if len(esc) > 1:  # \uXXXX, \xXX
+            return chr(int(esc[1:], 16))
+        return _JS_SIMPLE_ESCAPES.get(esc, esc)  # \\ \' \" \/ → сам символ
+
+    # \uD83D\uDE00 раскодируются по половинке — склеиваем суррогатные пары.
+    return _JS_ESCAPE_RE.sub(_one, literal).encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+def _parse_initial_state(html: str) -> dict | None:
+    """`initialState` firm-страницы или None, если его нет или он не разобрался.
+
+    Без раскодирования JS-экранирования JSON ломается на первой же кавычке в данных:
+    у ближайших станций метро Алматы есть подпись «Линия "А"».
+    """
+    m = _INITIAL_STATE_RE.search(html)
+    if not m:
+        return None
+    try:
+        state = json.loads(_js_unescape(m.group(1)))
+    except ValueError:  # JSONDecodeError
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _extract_phones_from_html(html: str, gis_branch_id: int) -> list[dict] | None:
+    """Телефоны фирмы из `initialState` её страницы: [{"number", "text", "comment"}].
+
+    Берём только `data.entity.profile[<id>].data.contact_groups` — карточку этой фирмы.
+    `"type":"phone"` встречается на странице и вне неё (кнопка рекламного действия
+    «Бесплатная консультация», соседние фирмы), так что регулярка по всему HTML принесла
+    бы чужие номера. В DOM ссылка tel: только на первый номер, остальные — в состоянии.
+
+    None — карточку не разобрать (капча, сменилась разметка): номера неизвестны, и
+    затирать ими сохранённые нельзя. [] — карточка разобрана, телефонов на ней нет.
+    """
+    state = _parse_initial_state(html) or {}
+    data = state.get("data")
+    entity = data.get("entity") if isinstance(data, dict) else None
+    profiles = entity.get("profile") if isinstance(entity, dict) else None
+    if not isinstance(profiles, dict):
+        return None
+    entry = profiles.get(str(gis_branch_id))
+    if entry is None and len(profiles) == 1:
+        # Карточку отдали под другим id (2ГИС склеил или перенёс фирму).
+        entry = next(iter(profiles.values()))
+    firm = entry.get("data") if isinstance(entry, dict) else None
+    if not isinstance(firm, dict):
+        return None
+
+    phones: list[dict] = []
+    seen: set[str] = set()
+    for group in firm.get("contact_groups") or []:
+        for contact in (group.get("contacts") if isinstance(group, dict) else None) or []:
+            if not isinstance(contact, dict) or contact.get("type") != "phone":
+                continue
+            number = str(contact.get("value") or "").strip()
+            if not number or number in seen:
+                continue
+            seen.add(number)
+            phones.append({
+                "number": number,
+                "text": contact.get("text") or contact.get("print_text") or number,
+                "comment": contact.get("comment") or None,
+            })
+    return phones
 
 
 async def scrape_branch_preview(
@@ -671,15 +745,50 @@ def build_owner_review_url(gis_org_id: int, gis_branch_id: int, gis_review_id: s
 # Step 4 — aggregate scrape of one branch
 # ---------------------------------------------------------------------------
 
-async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url: str) -> dict:
+async def scrape_branch(
+    client: httpx.AsyncClient,
+    gis_branch_id: int,
+    firm_url: str,
+    *,
+    with_reviews: bool = True,
+    with_phones: bool = False,
+) -> dict:
     """
-    Скрапит адрес + распределение рейтинга + все отзывы одного филиала.
-    Возвращает словарь, готовый для upsert в БД.
+    Скрапит страницу филиала (имя, адрес, рубрики; телефоны при with_phones) и, при
+    with_reviews, распределение рейтинга и все отзывы. Возвращает словарь для upsert в БД.
+
+    rating/total_reviews/rating_distribution/reviews в словаре — только при with_reviews,
+    phones — только при with_phones (None — номера получить не удалось).
     """
-    (name, category, address, categories, city, org_id), distribution = await asyncio.gather(
-        scrape_branch_info(client, firm_url, gis_branch_id),
-        fetch_rating_distribution(client, gis_branch_id),
-    )
+    if with_reviews:
+        html, distribution = await asyncio.gather(
+            _fetch_firm_html(client, firm_url),
+            fetch_rating_distribution(client, gis_branch_id),
+        )
+    else:
+        html = await _fetch_firm_html(client, firm_url)
+        if html is None:
+            # Без отзывов страница — единственный источник данных: сохранять нечего,
+            # а пустые имя и адрес затёрли бы записанные прошлым сбором.
+            raise RuntimeError(f"Firm page unavailable: {firm_url}")
+    name, category, address, categories, city = _parse_firm_page(html)
+
+    result: dict = {
+        "gis_branch_id": gis_branch_id,
+        "company_name": name,
+        "category": category,
+        "categories": categories,
+        "address": address,
+        "url": firm_url,
+        "city": city,
+        "gis_org_id": extract_org_id(html, gis_branch_id) if html is not None else None,
+    }
+    if with_phones:
+        result["phones"] = _extract_phones_from_html(html, gis_branch_id) if html is not None else None
+        if html is not None and result["phones"] is None:
+            logger.warning("Branch %s: phones not found in firm page state (%s)", gis_branch_id, firm_url)
+    if not with_reviews:
+        return result
 
     all_reviews: list[dict] = []
     company_name: str | None = name
@@ -742,17 +851,11 @@ async def scrape_branch(client: httpx.AsyncClient, gis_branch_id: int, firm_url:
 
             await asyncio.sleep(random.uniform(settings.rate_limit_sleep_min, settings.rate_limit_sleep_max))
 
-    return {
-        "gis_branch_id": gis_branch_id,
-        "company_name": company_name,
-        "category": category,
-        "categories": categories,
-        "address": address,
-        "rating": final_rating,
-        "total_reviews": final_total,
-        "rating_distribution": distribution,
-        "url": firm_url,
-        "city": city,
-        "gis_org_id": org_id,
-        "reviews": all_reviews,
-    }
+    result.update(
+        company_name=company_name,
+        rating=final_rating,
+        total_reviews=final_total,
+        rating_distribution=distribution,
+        reviews=all_reviews,
+    )
+    return result

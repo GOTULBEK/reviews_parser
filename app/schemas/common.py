@@ -18,3 +18,8 @@ import enum
 class SourceType(str, enum.Enum):
     twogis = "2gis"
     zapis = "zapis"
+
+class CollectKind(str, enum.Enum):
+    """Что собирает задача сбора (ScrapeRequest.collect, SearchTask.collect)."""
+    reviews = "reviews"
+    phones = "phones"

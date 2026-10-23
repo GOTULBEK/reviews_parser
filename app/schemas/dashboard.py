@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 from pydantic import BaseModel
-from .common import BranchIdStr, SourceType
+from .common import BranchIdStr, CollectKind, SourceType
 
 Sentiment = Literal["pos", "neg", "neu", "unknown"]
 
@@ -112,6 +112,37 @@ class BranchesListResponse(BaseModel):
     status: str
     count: int
     branches: list[BranchListItem]
+
+class PhoneItem(BaseModel):
+    # Номер для звонка: "+77011234567" или короткий "7711" — годится в tel:.
+    number: str
+    # Как номер показывает источник: "+7‒701‒123‒45‒67".
+    text: str | None = None
+    # Подпись источника к номеру: "отдел продаж", "единый номер".
+    comment: str | None = None
+
+class BranchPhonesItem(BaseModel):
+    branch_id: UUID
+    gis_branch_id: BranchIdStr
+    source: SourceType
+    name: str | None = None
+    address: str | None = None
+    city: str | None = None
+    url: str
+    phones: list[PhoneItem] = []
+    # null — номера этого филиала не собирались ни одной задачей.
+    phones_scraped_at: datetime | None = None
+
+class BranchPhonesResponse(BaseModel):
+    task_id: UUID
+    status: str
+    collect: list[CollectKind]
+    count: int
+    phones_total: int
+    branches_with_phones: int
+    limit: int
+    offset: int
+    branches: list[BranchPhonesItem]
 
 class ReviewListItem(BaseModel):
     id: UUID

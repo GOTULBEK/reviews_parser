@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.db.database import Base, engine
+from app.db.schema import ensure_added_columns
 from app.api.v1.router import api_router
 
 logging.basicConfig(
@@ -16,6 +17,7 @@ logging.basicConfig(
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await ensure_added_columns(conn)
     yield
     await engine.dispose()
 

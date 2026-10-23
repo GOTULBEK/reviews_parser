@@ -1,24 +1,28 @@
 from datetime import datetime
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict
-from .common import BranchIdStr
+from .common import BranchIdStr, CollectKind
 
 class SearchTaskResponse(BaseModel):
     task_id: UUID
     status: str
     query: str | None = None
     city: str
+    collect: list[CollectKind] = [CollectKind.reviews]
 
 class TaskStatusResponse(BaseModel):
     task_id: UUID
     status: str
     query: str | None = None
     city: str
+    collect: list[CollectKind] = [CollectKind.reviews]
     total_branches_found: int
     branches_completed: int
     total_reviews_collected: int
     reviews_total: int
     reviews_parsed: int
+    # Сколько номеров нашлось на карточках филиалов в этом прогоне (все, не только новые).
+    total_phones_collected: int = 0
     error_message: str | None = None
     created_at: datetime
     started_at: datetime | None = None

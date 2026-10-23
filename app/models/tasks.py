@@ -12,7 +12,7 @@ from sqlalchemy import (
     func,
     ForeignKey
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
@@ -34,10 +34,18 @@ class SearchTask(Base):
         SAEnum(TaskStatus, name="task_status"), nullable=False, default=TaskStatus.pending
     )
     error_message: Mapped[str | None] = mapped_column(Text)
+    # Что собирает задача: "reviews" и/или "phones" (schemas.common.CollectKind).
+    # Задачи до появления выбора собирали только отзывы — отсюда серверный дефолт.
+    collect: Mapped[list[str]] = mapped_column(
+        ARRAY(String(16)), nullable=False, server_default="{reviews}"
+    )
 
     total_branches_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     branches_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_reviews_collected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_phones_collected: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

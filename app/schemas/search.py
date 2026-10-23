@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
 import typing
 from typing import Any
-from .common import BranchIdStr, SourceType
+from .common import BranchIdStr, CollectKind, SourceType
 
 class PreviewRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=512)
@@ -42,6 +42,9 @@ class ScrapeRequest(BaseModel):
     branches: list[ScrapeBranchItem] = Field(default_factory=list, max_length=10000)
     gis_branch_ids: list[str] | None = None
     query: str | None = Field(default=None, max_length=512)
+    # Что собирать: отзывы, телефоны или и то и другое (хотя бы одно). Без поля —
+    # только отзывы, как до появления выбора: старый фронт его не шлёт.
+    collect: list[CollectKind] = Field(default_factory=lambda: [CollectKind.reviews], min_length=1)
 
     @model_validator(mode="before")
     @classmethod
@@ -72,3 +75,7 @@ class ScrapeRequest(BaseModel):
                 out.append(x)
         return out
 
+    @field_validator("collect")
+    @classmethod
+    def _dedupe_collect(cls, v: list[CollectKind]) -> list[CollectKind]:
+        return list(dict.fromkeys(v))

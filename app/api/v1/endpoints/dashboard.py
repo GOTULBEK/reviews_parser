@@ -1188,6 +1188,80 @@ async def get_task_branches(
 
 
 # ---------------------------------------------------------------------------
+# Dashboard — /phones
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{task_id}/phones",
+    response_model=BranchPhonesResponse,
+    tags=["dashboard"],
+    summary="Телефоны филиалов задачи (с пагинацией)",
+)
+async def get_task_phones(
+    task_id: UUID,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    source: Literal["2gis", "zapis", "all"] = Query("all", description="Filter by data source"),
+    city: str = Query("all", description="Filter by branch city slug (e.g. almaty, astana); 'all' = no filter"),
+    session: AsyncSession = Depends(get_session),
+):
+    """Номера с карточек филиалов задачи. Номера хранятся на филиале, как и отзывы,
+    поэтому это последние собранные по филиалу — этой задачей или более поздней.
+
+    phones_scraped_at = null — номера филиала не собирались; phones = [] при дате —
+    собирались, на карточке номеров нет. count/phones_total/branches_with_phones —
+    по всем филиалам под фильтром, не по странице.
+    """
+    task = await _require_task(task_id, session)
+
+    n_phones = func.coalesce(func.jsonb_array_length(Branch.phones), 0)
+    totals_stmt = (
+        select(func.count(), func.coalesce(func.sum(n_phones), 0), func.count().filter(n_phones > 0))
+        .select_from(Branch)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
+        .where(SearchTaskBranch.task_id == task_id)
+    )
+    page_stmt = (
+        select(Branch)
+        .join(SearchTaskBranch, SearchTaskBranch.branch_id == Branch.id)
+        .where(SearchTaskBranch.task_id == task_id)
+        .order_by(Branch.name.asc().nulls_last(), Branch.address.asc().nulls_last(), Branch.id)
+        .limit(limit)
+        .offset(offset)
+    )
+    totals_stmt = _apply_branch_filters(totals_stmt, source, city)
+    page_stmt = _apply_branch_filters(page_stmt, source, city)
+
+    total, phones_total, branches_with_phones = (await session.execute(totals_stmt)).one()
+    branches = (await session.execute(page_stmt)).scalars().all()
+
+    return BranchPhonesResponse(
+        task_id=task.id,
+        status=task.status.value,
+        collect=task.collect,
+        count=int(total or 0),
+        phones_total=int(phones_total or 0),
+        branches_with_phones=int(branches_with_phones or 0),
+        limit=limit,
+        offset=offset,
+        branches=[
+            BranchPhonesItem(
+                branch_id=b.id,
+                gis_branch_id=b.gis_branch_id,
+                source=b.source,
+                name=b.name,
+                address=b.address,
+                city=b.city,
+                url=b.url,
+                phones=[PhoneItem.model_validate(p) for p in (b.phones or [])],
+                phones_scraped_at=b.phones_scraped_at,
+            )
+            for b in branches
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dashboard — /reviews
 # ---------------------------------------------------------------------------
 

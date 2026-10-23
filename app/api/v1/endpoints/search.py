@@ -154,7 +154,7 @@ async def search_preview(payload: PreviewRequest):
     "/scrape",
     response_model=SearchTaskResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Запустить сбор отзывов для выбранных филиалов",
+    summary="Запустить сбор отзывов и/или телефонов для выбранных филиалов",
 )
 async def start_scrape(
     payload: ScrapeRequest,
@@ -163,7 +163,12 @@ async def start_scrape(
 ):
     # Determine the first source just as primary or store empty if none
     first_source = payload.branches[0].source if payload.branches else SourceType.twogis
-    task = SearchTask(query=payload.query, city=payload.city, source=first_source)
+    task = SearchTask(
+        query=payload.query,
+        city=payload.city,
+        source=first_source,
+        collect=[c.value for c in payload.collect],
+    )
     session.add(task)
     await session.commit()
     await session.refresh(task)
@@ -196,4 +201,5 @@ async def start_scrape(
         status=task.status.value,
         query=task.query,
         city=task.city,
+        collect=task.collect,
     )

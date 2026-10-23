@@ -38,6 +38,13 @@ GET /reviews/{uuid}       ←─── прямой доступ
 | `search_tasks` | Журнал запусков с прогрессом и статусом. |
 | `search_task_branches` | Многие-ко-многим: какую задачу какие филиалы покрыли. |
 
+Телефоны хранятся на филиале: `branches.phones` (JSONB, `NULL` — не собирались,
+`[]` — на карточке номеров нет) и `branches.phones_scraped_at`. Что собирала задача —
+`search_tasks.collect`. Эти колонки (и `branches.gis_org_id`) появились в уже
+существующих таблицах, а `create_all` колонки не добавляет, поэтому их на старте
+досоздаёт `app/db/schema.py` (только отсутствующие; то же — миграции `7d3e9f1a2b4c`
+и `a7d2c4e9b1f3`).
+
 Идемпотентность: UPSERT на `gis_branch_id` и `gis_review_id`. Повторный запуск
 запроса обновит тексты/рейтинги изменившихся отзывов.
 
@@ -111,9 +118,16 @@ curl -X POST http://localhost:8000/search/scrape \
   -d '{
     "city": "astana",
     "gis_branch_ids": [70000001041329707, 70000001085622713],
-    "query": "Underground"
+    "query": "Underground",
+    "collect": ["reviews", "phones"]
   }'
 ```
+
+`collect` — что собирать: `"reviews"`, `"phones"` или оба (хотя бы одно, иначе 422).
+Без поля — только отзывы. Номера 2ГИС берутся из `initialState` страницы фирмы, которую
+сбор и так загружает, номера zapis.kz — из `phoneNumbers` карточки, так что лишних
+запросов они не стоят. Без `"reviews"` API отзывов не вызывается, а рейтинг и
+`total_reviews` филиала не меняются.
 
 Ответ (HTTP 202) — `task_id` для опроса:
 ```json
@@ -121,7 +135,8 @@ curl -X POST http://localhost:8000/search/scrape \
   "task_id": "3a7b8c9d-...",
   "status": "pending",
   "query": "Underground",
-  "city": "astana"
+  "city": "astana",
+  "collect": ["reviews", "phones"]
 }
 ```
 
@@ -154,6 +169,17 @@ curl http://localhost:8000/tasks/3a7b8c9d-.../results
 Вернет все филиалы и отзывы в структуре, соответствующей старым JSON-дампам
 оригинального скрипта. Передай `?include_reviews=false` чтобы получить только
 метаданные филиалов.
+
+### Телефоны филиалов
+
+```bash
+curl "http://localhost:8000/tasks/3a7b8c9d-.../phones?limit=100&offset=0&city=all&source=all"
+```
+
+Филиалы задачи с номерами: `phones: [{"number": "+77011234567", "text": "+7‒701‒123‒45‒67",
+"comment": "отдел продаж"}]`, `phones_scraped_at` (`null` — номера филиала не собирались),
+сводка `count` / `phones_total` / `branches_with_phones` по всем филиалам под фильтром.
+Пока задача идёт — 409, как у остальных эндпоинтов задачи.
 
 ### 4. Один отзыв
 
